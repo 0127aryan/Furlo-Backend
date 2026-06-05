@@ -1,7 +1,7 @@
 import express from 'express'
 import cors from 'cors'
 import dotenv from 'dotenv'
-import waitlistRouter from './routes/waitlist'
+import waitlistRouter from './routes/waitlist.js'
 
 dotenv.config()
 

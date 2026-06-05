@@ -25,7 +25,13 @@ app.get('/health', (_req, res) => {
 // Routes
 app.use('/api/waitlist', waitlistRouter)
 
-app.listen(port, () => {
-  console.log(`✓ Furlo backend running on http://localhost:${port}`)
-  console.log(`  CORS allowed origin: ${frontendUrl}`)
-})
+// Only listen if not running as a Vercel serverless function
+if (process.env.NODE_ENV !== 'production' || !process.env.VERCEL) {
+  app.listen(port, () => {
+    console.log(`✓ Furlo backend running on http://localhost:${port}`)
+    console.log(`  CORS allowed origin: ${frontendUrl}`)
+  })
+}
+
+export default app
+

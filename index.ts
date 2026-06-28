@@ -1,9 +1,7 @@
+import 'dotenv/config'
 import express from 'express'
 import cors from 'cors'
-import dotenv from 'dotenv'
-import waitlistRouter from './routes/waitlist.js'
-
-dotenv.config()
+import authRouter from './routes/auth.js'
 
 const app = express()
 const port = process.env.PORT ?? 4000
@@ -14,7 +12,13 @@ if (!frontendUrl) {
   process.exit(1)
 }
 
-app.use(cors({ origin: frontendUrl, methods: ['GET', 'POST', 'OPTIONS'] }))
+app.use(
+  cors({
+    origin: frontendUrl,
+    credentials: true,
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  })
+)
 app.use(express.json())
 
 // Health check
@@ -23,7 +27,7 @@ app.get('/health', (_req, res) => {
 })
 
 // Routes
-app.use('/api/waitlist', waitlistRouter)
+app.use('/auth', authRouter)
 
 // Only listen if not running as a Vercel serverless function
 if (process.env.NODE_ENV !== 'production' || !process.env.VERCEL) {

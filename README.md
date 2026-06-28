@@ -29,7 +29,7 @@ Run each `.sql` file in `supabase/migrations/` in order via the **Supabase SQL E
 
 | Migration | Description |
 |---|---|
-| `20260605_create_waitlist.sql` | Waitlist table with RLS |
+| `20260607_create_schema.sql` | Full app schema (users, pets, posts, communities) |
 
 ### 3. Configure Frontend
 
@@ -39,9 +39,3 @@ Copy your Supabase credentials into `Furlo-Frontend/.env.local`:
 NEXT_PUBLIC_SUPABASE_URL=https://your-project-ref.supabase.co
 NEXT_PUBLIC_SUPABASE_ANON_KEY=your-anon-key-here
 ```
-
-## Viewing Waitlist Signups
-
-In the Supabase dashboard → **Table Editor** → `waitlist` table.
-
-You can also use the **Resend** integration to trigger emails to waitlisted users once launched.

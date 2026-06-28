@@ -21,14 +21,14 @@ async function testConnection() {
 
   try {
     const start = Date.now()
-    const { data, error } = await supabase.from('waitlist').select('id').limit(1)
+    const { data, error } = await supabase.from('users').select('id').limit(1)
 
     if (error) {
       throw error
     }
 
     console.log(`✓ Success: Connected to Supabase database! (Response time: ${Date.now() - start}ms)`)
-    console.log('Waitlist table query succeeded.')
+    console.log('DB connection test succeeded.')
     process.exit(0)
   } catch (err: any) {
     console.error('❌ Connection/Query Error:')

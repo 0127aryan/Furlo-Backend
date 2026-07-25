@@ -290,14 +290,81 @@ router.get('/callback', async (req: Request, res: Response): Promise<void> => {
   }
 })
 
+/**
+ * GET /auth/check-username
+ * Checks if a pet username is available
+ */
+router.get('/check-username', async (req: Request, res: Response): Promise<void> => {
+  try {
+    const username = req.query.username as string
+    if (!username || username.length < 3 || username.length > 30) {
+      res.status(400).json({ error: 'Username must be between 3 and 30 characters.' })
+      return
+    }
+
+    if (!/^[a-zA-Z0-9_]+$/.test(username)) {
+      res.status(400).json({ error: 'Username can only contain alphanumeric characters and underscores.' })
+      return
+    }
+
+    const supabase = createClient(supabaseUrl!, supabaseServiceKey!)
+    const { data: existingPet, error } = await supabase
+      .from('pets')
+      .select('id')
+      .eq('username', username)
+      .limit(1)
+
+    if (error) {
+      res.status(500).json({ error: error.message })
+      return
+    }
+
+    const available = !existingPet || existingPet.length === 0
+    res.status(200).json({ available })
+  } catch (err) {
+    console.error('[auth] Check username error:', err)
+    res.status(500).json({ error: 'Internal server error checking username.' })
+  }
+})
+
 const onboardingSetupSchema = z.object({
   petName: z.string().min(1, 'Name is required'),
-  petUsername: z.string().min(3, 'Username must be at least 3 characters'),
+  petUsername: z.string().optional(),
+  petType: z.string().optional(),
+  customPetType: z.string().optional(),
   breed: z.string().optional(),
+  customBreed: z.string().optional(),
   city: z.string().min(1, 'City is required'),
   gender: z.enum(['male', 'female', 'unknown']).optional(),
   bio: z.string().max(300).optional(),
   personalityTags: z.array(z.string()).optional(),
+  customPersonalityTags: z.array(z.string()).optional(),
+  avatarData: z.string().optional(),
+  packs: z.array(z.string()).optional(),
+})
+
+/**
+ * GET /auth/communities
+ * Lists all active communities
+ */
+router.get('/communities', async (req: Request, res: Response): Promise<void> => {
+  try {
+    const supabase = createClient(supabaseUrl!, supabaseServiceKey!)
+    const { data, error } = await supabase
+      .from('communities')
+      .select('id, name, slug, description, cover_image_url, member_count')
+      .eq('is_active', true)
+
+    if (error) {
+      res.status(500).json({ error: error.message })
+      return
+    }
+
+    res.status(200).json(data)
+  } catch (err) {
+    console.error('[auth] Get communities error:', err)
+    res.status(500).json({ error: 'Internal server error fetching communities.' })
+  }
 })
 
 /**
@@ -326,22 +393,58 @@ router.post('/complete-onboarding', async (req: Request, res: Response): Promise
       return
     }
 
-    const { petName, petUsername, breed, city, gender, bio, personalityTags } = parsed.data
+    const { petName, petUsername: rawUsername, petType, customPetType, breed, customBreed, city, gender, bio, personalityTags, customPersonalityTags, avatarData, packs } = parsed.data
 
-    // Check if username is already taken
-    const { data: existingPet } = await supabase
-      .from('pets')
-      .select('id')
-      .eq('username', petUsername)
-      .limit(1)
+    // If username is provided, sanitize & check availability. Otherwise autogenerate a clean unique handle.
+    let petUsername = rawUsername ? rawUsername.toLowerCase().replace(/[^a-z0-9_]/g, '') : ''
+    if (!petUsername || petUsername.length < 3) {
+      const cleanName = petName.toLowerCase().replace(/[^a-z0-9]/g, '') || 'pet'
+      petUsername = `${cleanName}_${Math.floor(1000 + Math.random() * 9000)}`
+    } else {
+      const { data: existingPet } = await supabase
+        .from('pets')
+        .select('id')
+        .eq('username', petUsername)
+        .limit(1)
 
-    if (existingPet && existingPet.length > 0) {
-      res.status(409).json({ error: 'Username is already taken by another pack member.' })
-      return
+      if (existingPet && existingPet.length > 0) {
+        petUsername = `${petUsername}_${Math.floor(100 + Math.random() * 900)}`
+      }
     }
 
     // Default placeholder images
-    const defaultProfileImage = 'https://images.unsplash.com/photo-1543466835-00a7907e9de1?auto=format&fit=crop&q=80&w=250'
+    let profileImageUrl = 'https://images.unsplash.com/photo-1543466835-00a7907e9de1?auto=format&fit=crop&q=80&w=250'
+
+    // Handle base64 avatar upload if provided
+    if (avatarData && avatarData.startsWith('data:image/')) {
+      try {
+        const matches = avatarData.match(/^data:([A-Za-z-+\/]+);base64,(.+)$/)
+        if (matches && matches.length === 3) {
+          const mimeType = matches[1]
+          const buffer = Buffer.from(matches[2], 'base64')
+          const extension = mimeType.split('/')[1] || 'jpeg'
+          const fileName = `${petUsername}_${Date.now()}.${extension}`
+
+          const { data: uploadData, error: uploadError } = await supabase.storage
+            .from('pet-profiles')
+            .upload(fileName, buffer, {
+              contentType: mimeType,
+              upsert: true,
+            })
+
+          if (uploadError) {
+            console.error('[storage] Avatar upload failed:', uploadError.message)
+          } else {
+            const { data: { publicUrl } } = supabase.storage
+              .from('pet-profiles')
+              .getPublicUrl(fileName)
+            profileImageUrl = publicUrl
+          }
+        }
+      } catch (uploadErr) {
+        console.error('[storage] Exception during avatar upload:', uploadErr)
+      }
+    }
 
     // Insert pet record
     const { data: petRecord, error: insertError } = await supabase
@@ -350,12 +453,13 @@ router.post('/complete-onboarding', async (req: Request, res: Response): Promise
         owner_id: user.id,
         name: petName,
         username: petUsername,
-        breed: breed || 'Human',
-        city: city || 'Bangalore',
+        pet_type: petType || 'dogs',
+        breed: breed || 'Unknown',
+        city: city || 'Unknown',
         gender: gender || 'unknown',
         bio: bio || '',
         personality_tags: personalityTags || [],
-        profile_image_url: defaultProfileImage,
+        profile_image_url: profileImageUrl,
         vaccination_status: 'unknown',
         is_public: true,
       })
@@ -366,6 +470,72 @@ router.post('/complete-onboarding', async (req: Request, res: Response): Promise
       console.error('[auth] Error inserting pet profile:', insertError.message)
       res.status(500).json({ error: 'Failed to save pet profile. Please try again.' })
       return
+    }
+
+    // Record custom breed/pet_type/personality_tags for admin catalog approval notification
+    if (customBreed || customPetType || (customPersonalityTags && customPersonalityTags.length > 0)) {
+      try {
+        const approvalsToInsert: any[] = []
+        if (customBreed) {
+          approvalsToInsert.push({
+            pet_id: petRecord.id,
+            submission_type: 'breed',
+            pet_type: petType || 'dogs',
+            name: customBreed,
+            status: 'pending',
+          })
+        }
+        if (customPetType) {
+          approvalsToInsert.push({
+            pet_id: petRecord.id,
+            submission_type: 'pet_type',
+            pet_type: customPetType,
+            name: customPetType,
+            status: 'pending',
+          })
+        }
+        if (customPersonalityTags && customPersonalityTags.length > 0) {
+          customPersonalityTags.forEach((tag) => {
+            approvalsToInsert.push({
+              pet_id: petRecord.id,
+              submission_type: 'personality_tag',
+              pet_type: petType || 'dogs',
+              name: tag,
+              status: 'pending',
+            })
+          })
+        }
+        await supabase.from('pending_breed_approvals').insert(approvalsToInsert)
+      } catch (approvalErr) {
+        console.error('[auth] Exception logging pending breed/tag approval:', approvalErr)
+      }
+    }
+
+    // Join communities if selected
+    if (packs && packs.length > 0) {
+      try {
+        const { data: dbCommunities, error: commError } = await supabase
+          .from('communities')
+          .select('id, slug')
+          .in('slug', packs)
+
+        if (!commError && dbCommunities && dbCommunities.length > 0) {
+          const memberRows = dbCommunities.map((c) => ({
+            community_id: c.id,
+            pet_id: petRecord.id,
+          }))
+
+          const { error: joinError } = await supabase
+            .from('community_members')
+            .insert(memberRows)
+
+          if (joinError) {
+            console.error('[auth] Error joining communities:', joinError.message)
+          }
+        }
+      } catch (joinErr) {
+        console.error('[auth] Exception while joining communities:', joinErr)
+      }
     }
 
     res.status(200).json({

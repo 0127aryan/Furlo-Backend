@@ -2,6 +2,7 @@ import 'dotenv/config'
 import express from 'express'
 import cors from 'cors'
 import authRouter from './routes/auth.js'
+import adminRouter from './routes/admin.js'
 
 const app = express()
 const port = process.env.PORT ?? 4000
@@ -28,6 +29,7 @@ app.get('/health', (_req, res) => {
 
 // Routes
 app.use('/auth', authRouter)
+app.use('/admin', adminRouter)
 
 // Only listen if not running as a Vercel serverless function
 if (process.env.NODE_ENV !== 'production' || !process.env.VERCEL) {

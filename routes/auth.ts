@@ -34,8 +34,13 @@ const getCookieOptions = (maxAgeMs: number) => ({
   maxAge: maxAgeMs,
 })
 
-const COOKIE_SESSION_MAX_AGE = 60 * 60 * 1000 // 1 hour (matching typical access token expiry)
-const COOKIE_REFRESH_MAX_AGE = 30 * 24 * 60 * 60 * 1000 // 30 days
+const COOKIE_SESSION_MAX_AGE = process.env.COOKIE_SESSION_MAX_AGE_MS
+  ? parseInt(process.env.COOKIE_SESSION_MAX_AGE_MS, 10)
+  : 60 * 60 * 1000
+
+const COOKIE_REFRESH_MAX_AGE = process.env.COOKIE_REFRESH_MAX_AGE_MS
+  ? parseInt(process.env.COOKIE_REFRESH_MAX_AGE_MS, 10)
+  : 30 * 24 * 60 * 60 * 1000
 
 // Zod schemas for input validation
 const signupSchema = z.object({

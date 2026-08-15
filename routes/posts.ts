@@ -273,10 +273,14 @@ router.post('/create', async (req: Request, res: Response): Promise<void> => {
                   .from('pet-profiles')
                   .getPublicUrl(fileName)
                 mediaUrl = publicUrl
+              } else {
+                console.error('[posts] Supabase storage upload error:', uploadError.message)
+                mediaUrl = item
               }
             }
           } catch (e) {
             console.error('[posts] Exception uploading media:', e)
+            mediaUrl = item
           }
         }
 

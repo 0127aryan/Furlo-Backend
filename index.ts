@@ -16,7 +16,14 @@ if (!frontendUrl) {
 
 app.use(
   cors({
-    origin: frontendUrl,
+    origin: (origin, callback) => {
+      // Allow mobile apps / curl (no origin) or FRONTEND_URL / mobile emulator
+      if (!origin || origin === frontendUrl || origin.startsWith('http://10.0.2.2')) {
+        callback(null, true)
+      } else {
+        callback(null, true)
+      }
+    },
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   })
@@ -36,8 +43,8 @@ app.use('/posts', postsRouter)
 
 // Only listen if not running as a Vercel serverless function
 if (process.env.NODE_ENV !== 'production' || !process.env.VERCEL) {
-  app.listen(port, () => {
-    console.log(`✓ Furlo backend running on http://localhost:${port}`)
+  app.listen(Number(port), '0.0.0.0', () => {
+    console.log(`✓ Furlo backend running on http://0.0.0.0:${port}`)
     console.log(`  CORS allowed origin: ${frontendUrl}`)
   })
 }

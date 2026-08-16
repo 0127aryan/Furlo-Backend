@@ -25,6 +25,18 @@ const getCookie = (req: Request, name: string): string | undefined => {
   return undefined
 }
 
+// Helper to extract session token from cookie or Authorization Bearer header
+const getAccessToken = (req: Request): string | null => {
+  const sessionCookie = getCookie(req, 'furlo_session')
+  if (sessionCookie) return sessionCookie
+
+  const authHeader = req.headers.authorization
+  if (authHeader && authHeader.startsWith('Bearer ')) {
+    return authHeader.substring(7)
+  }
+  return null
+}
+
 // Cookie setting options helper
 const getCookieOptions = (maxAgeMs: number) => ({
   httpOnly: true,
@@ -51,6 +63,10 @@ const signupSchema = z.object({
 const loginSchema = z.object({
   email: z.string().email('Invalid email address'),
   password: z.string(),
+})
+
+const refreshSchema = z.object({
+  refresh_token: z.string().min(1, 'Refresh token is required'),
 })
 
 /**
@@ -97,7 +113,7 @@ router.post('/signup', async (req: Request, res: Response): Promise<void> => {
 
     const { email, password } = parsed.data
     const supabase = createClient(supabaseUrl!, supabaseServiceKey!)
-    const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000'
+    const frontendUrl = process.env.FRONTEND_URL
 
     const { data, error } = await supabase.auth.signUp({
       email,
@@ -151,7 +167,7 @@ router.post('/resend-confirmation', async (req: Request, res: Response): Promise
     }
 
     const supabase = createClient(supabaseUrl!, supabaseServiceKey!)
-    const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000'
+    const frontendUrl = process.env.FRONTEND_URL
 
     const { error } = await supabase.auth.resend({
       type: 'signup',
@@ -308,10 +324,59 @@ router.post('/login', async (req: Request, res: Response): Promise<void> => {
       return
     }
 
-    res.status(200).json(context)
+    res.status(200).json({
+      user: context.user,
+      activePet: context.activePet,
+      session: {
+        access_token,
+        refresh_token,
+      },
+    })
   } catch (err) {
     console.error('[auth] Login error:', err)
     res.status(500).json({ error: 'Internal server error during login.' })
+  }
+})
+
+/**
+ * POST /auth/refresh
+ * Refresh session tokens using a refresh token (for mobile & API clients)
+ */
+router.post('/refresh', async (req: Request, res: Response): Promise<void> => {
+  try {
+    const parsed = refreshSchema.safeParse(req.body)
+    if (!parsed.success) {
+      res.status(400).json({ error: parsed.error.issues[0].message })
+      return
+    }
+
+    const { refresh_token } = parsed.data
+    const supabase = createClient(supabaseUrl!, supabaseServiceKey!)
+
+    const { data, error } = await supabase.auth.refreshSession({ refresh_token })
+
+    if (error || !data.session) {
+      res.status(401).json({ error: error?.message || 'Invalid or expired refresh token.' })
+      return
+    }
+
+    const { access_token: newAccessToken, refresh_token: newRefreshToken } = data.session
+
+    // Additively update web cookies if web session exists
+    res.cookie('furlo_session', newAccessToken, getCookieOptions(COOKIE_SESSION_MAX_AGE))
+    if (newRefreshToken) {
+      res.cookie('furlo_refresh', newRefreshToken, getCookieOptions(COOKIE_REFRESH_MAX_AGE))
+    }
+
+    res.status(200).json({
+      session: {
+        access_token: newAccessToken,
+        refresh_token: newRefreshToken,
+      },
+    })
+  } catch (err) {
+    console.error('[auth] Refresh error:', err)
+    res.status(500).json({ error: 'Internal server error during session refresh.' })
   }
 })
 
@@ -321,7 +386,7 @@ router.post('/login', async (req: Request, res: Response): Promise<void> => {
  */
 router.post('/logout', async (req: Request, res: Response): Promise<void> => {
   try {
-    const accessToken = getCookie(req, 'furlo_session')
+    const accessToken = getAccessToken(req)
     
     // Clear cookies regardless of Supabase logout outcome
     res.clearCookie('furlo_session', { path: '/' })
@@ -352,7 +417,7 @@ router.post('/logout', async (req: Request, res: Response): Promise<void> => {
  */
 router.get('/me', async (req: Request, res: Response): Promise<void> => {
   try {
-    let accessToken = getCookie(req, 'furlo_session')
+    let accessToken = getAccessToken(req)
     const refreshToken = getCookie(req, 'furlo_refresh')
     const supabase = createClient(supabaseUrl!, supabaseServiceKey!)
 
@@ -412,7 +477,7 @@ router.get('/callback', async (req: Request, res: Response): Promise<void> => {
     const code = req.query.code as string
     const token_hash = req.query.token_hash as string
     const type = req.query.type as string
-    const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000'
+    const frontendUrl = process.env.FRONTEND_URL
 
     const supabase = createClient(supabaseUrl!, supabaseServiceKey!)
     let sessionData: any = null
@@ -455,7 +520,7 @@ router.get('/callback', async (req: Request, res: Response): Promise<void> => {
     }
   } catch (err) {
     console.error('[auth] Auth callback error:', err)
-    res.redirect(`${process.env.FRONTEND_URL || 'http://localhost:3000'}/join?error=server_error`)
+    res.redirect(`${process.env.FRONTEND_URL}/join?error=server_error`)
   }
 })
 
@@ -569,7 +634,7 @@ router.get('/communities', async (req: Request, res: Response): Promise<void> =>
  */
 router.post('/complete-onboarding', async (req: Request, res: Response): Promise<void> => {
   try {
-    const accessToken = getCookie(req, 'furlo_session')
+    const accessToken = getAccessToken(req)
     if (!accessToken) {
       res.status(401).json({ error: 'Unauthorized. Please login first.' })
       return
@@ -817,7 +882,7 @@ router.post('/complete-onboarding', async (req: Request, res: Response): Promise
  */
 router.put('/update-pet-profile', async (req: Request, res: Response): Promise<void> => {
   try {
-    const accessToken = getCookie(req, 'furlo_session')
+    const accessToken = getAccessToken(req)
     if (!accessToken) {
       res.status(401).json({ error: 'Unauthorized' })
       return

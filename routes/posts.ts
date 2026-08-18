@@ -2,6 +2,7 @@ import { Router, Request, Response } from 'express'
 import { createClient } from '@supabase/supabase-js'
 import dotenv from 'dotenv'
 import { z } from 'zod'
+import { broadcastFeedCounts, broadcastNewPost } from '../lib/feedBroadcast.js'
 
 dotenv.config()
 
@@ -30,6 +31,35 @@ function getAccessToken(req: Request): string | null {
     return authHeader.substring(7)
   }
   return null
+}
+
+function tallyByPostId(rows: { post_id: string }[] | null): Map<string, number> {
+  const counts = new Map<string, number>()
+  for (const row of rows || []) {
+    counts.set(row.post_id, (counts.get(row.post_id) || 0) + 1)
+  }
+  return counts
+}
+
+async function recountLikes(supabase: ReturnType<typeof createClient>, postId: string): Promise<number> {
+  const { count } = await supabase
+    .from('likes')
+    .select('id', { count: 'exact', head: true })
+    .eq('post_id', postId)
+  const likeCount = count ?? 0
+  await supabase.from('posts').update({ like_count: likeCount }).eq('id', postId)
+  return likeCount
+}
+
+async function recountComments(supabase: ReturnType<typeof createClient>, postId: string): Promise<number> {
+  const { count } = await supabase
+    .from('comments')
+    .select('id', { count: 'exact', head: true })
+    .eq('post_id', postId)
+    .eq('status', 'active')
+  const commentCount = count ?? 0
+  await supabase.from('posts').update({ comment_count: commentCount }).eq('id', postId)
+  return commentCount
 }
 
 const createPostSchema = z.object({
@@ -115,21 +145,27 @@ router.get('/feed', async (req: Request, res: Response): Promise<void> => {
       return
     }
 
-    // Check if activePetId has liked any of these posts
-    let likedPostIds = new Set<string>()
-    if (activePetId) {
-      const { data: likes } = await supabase
-        .from('likes')
-        .select('post_id')
-        .eq('pet_id', activePetId)
+    const postIds = (posts || []).map((post) => post.id)
+    const [likeRows, commentRows, myLikes] = await Promise.all([
+      postIds.length
+        ? supabase.from('likes').select('post_id').in('post_id', postIds)
+        : Promise.resolve({ data: [] as { post_id: string }[] }),
+      postIds.length
+        ? supabase.from('comments').select('post_id').eq('status', 'active').in('post_id', postIds)
+        : Promise.resolve({ data: [] as { post_id: string }[] }),
+      activePetId
+        ? supabase.from('likes').select('post_id').eq('pet_id', activePetId)
+        : Promise.resolve({ data: [] as { post_id: string }[] }),
+    ])
 
-      if (likes) {
-        likes.forEach((l) => likedPostIds.add(l.post_id))
-      }
-    }
+    const likeCounts = likeRows.error ? null : tallyByPostId(likeRows.data)
+    const commentCounts = commentRows.error ? null : tallyByPostId(commentRows.data)
+    const likedPostIds = new Set((myLikes.data || []).map((row) => row.post_id))
 
     const formattedPosts = posts?.map((post) => ({
       ...post,
+      like_count: likeCounts ? likeCounts.get(post.id) || 0 : post.like_count,
+      comment_count: commentCounts ? commentCounts.get(post.id) || 0 : post.comment_count,
       hasLiked: likedPostIds.has(post.id),
       media: post.post_media?.sort((a, b) => a.display_order - b.display_order) || [],
     }))
@@ -138,6 +174,59 @@ router.get('/feed', async (req: Request, res: Response): Promise<void> => {
   } catch (err) {
     console.error('[posts] Feed error:', err)
     res.status(500).json({ error: 'Failed to fetch feed' })
+  }
+})
+
+/**
+ * GET /posts/engagement?ids=&petId=
+ * Live Treat/Bark counts for posts currently on screen
+ */
+router.get('/engagement', async (req: Request, res: Response): Promise<void> => {
+  try {
+    const accessToken = getAccessToken(req)
+    if (!accessToken) {
+      res.status(401).json({ error: 'Unauthorized' })
+      return
+    }
+
+    const rawIds = String(req.query.ids || '')
+    const postIds = rawIds
+      .split(',')
+      .map((id) => id.trim())
+      .filter(Boolean)
+      .slice(0, 30)
+
+    if (postIds.length === 0) {
+      res.status(200).json({ posts: [] })
+      return
+    }
+
+    const activePetId = req.query.petId as string | undefined
+    const supabase = createClient(supabaseUrl!, supabaseServiceKey!)
+
+    const [likeRows, commentRows, myLikes] = await Promise.all([
+      supabase.from('likes').select('post_id').in('post_id', postIds),
+      supabase.from('comments').select('post_id').eq('status', 'active').in('post_id', postIds),
+      activePetId
+        ? supabase.from('likes').select('post_id').eq('pet_id', activePetId).in('post_id', postIds)
+        : Promise.resolve({ data: [] as { post_id: string }[] }),
+    ])
+
+    const likeCounts = tallyByPostId(likeRows.data)
+    const commentCounts = tallyByPostId(commentRows.data)
+    const likedPostIds = new Set((myLikes.data || []).map((row) => row.post_id))
+
+    res.status(200).json({
+      posts: postIds.map((id) => ({
+        id,
+        like_count: likeCounts.get(id) || 0,
+        comment_count: commentCounts.get(id) || 0,
+        hasLiked: likedPostIds.has(id),
+      })),
+    })
+  } catch (err) {
+    console.error('[posts] Engagement error:', err)
+    res.status(500).json({ error: 'Failed to fetch engagement' })
   }
 })
 
@@ -298,12 +387,24 @@ router.post('/create', async (req: Request, res: Response): Promise<void> => {
       }
     }
 
+    const createdPost = {
+      ...newPost,
+      hasLiked: false,
+      media: insertedMedia
+        .filter((item: { media_url?: string }) => item?.media_url && !String(item.media_url).startsWith('data:'))
+        .map((item: { id: string; media_url: string; display_order: number }) => ({
+          id: item.id,
+          media_url: item.media_url,
+          display_order: item.display_order,
+        })),
+    }
+
+    await broadcastNewPost(createdPost).catch((err) => {
+      console.error('[posts] Live post broadcast failed:', err)
+    })
+
     res.status(201).json({
-      post: {
-        ...newPost,
-        hasLiked: false,
-        media: insertedMedia,
-      },
+      post: createdPost,
     })
   } catch (err) {
     console.error('[posts] Create error:', err)
@@ -352,14 +453,15 @@ router.post('/:id/like', async (req: Request, res: Response): Promise<void> => {
       hasLiked = true
     }
 
-    // Get updated like_count
-    const { data: post } = await supabase
-      .from('posts')
-      .select('like_count')
-      .eq('id', postId)
-      .single()
+    const likeCount = await recountLikes(supabase, postId)
+    await broadcastFeedCounts({
+      postId,
+      likeCount,
+      likedByPetId: hasLiked ? petId : null,
+      unlikedByPetId: hasLiked ? null : petId,
+    })
 
-    res.status(200).json({ hasLiked, likeCount: post?.like_count || 0 })
+    res.status(200).json({ hasLiked, likeCount })
   } catch (err) {
     console.error('[posts] Like error:', err)
     res.status(500).json({ error: 'Failed to update like status' })
@@ -454,7 +556,10 @@ router.post('/:id/comments', async (req: Request, res: Response): Promise<void> 
       return
     }
 
-    res.status(201).json({ comment: newComment })
+    const commentCount = await recountComments(supabase, postId)
+    await broadcastFeedCounts({ postId, commentCount })
+
+    res.status(201).json({ comment: newComment, commentCount })
   } catch (err) {
     console.error('[posts] Add comment error:', err)
     res.status(500).json({ error: 'Failed to add comment' })

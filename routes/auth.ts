@@ -6,6 +6,16 @@ const router = Router()
 
 const supabaseUrl = process.env.SUPABASE_URL
 const supabaseServiceKey = process.env.SUPABASE_SERVICE_KEY
+const supabaseAnonKey = process.env.SUPABASE_ANON_KEY
+
+function jwtRole(key: string): string | undefined {
+  try {
+    const payload = JSON.parse(Buffer.from(key.split('.')[1], 'base64url').toString('utf8')) as { role?: string }
+    return payload.role
+  } catch {
+    return undefined
+  }
+}
 
 if (!supabaseUrl || !supabaseServiceKey) {
   console.error('[auth] SUPABASE_URL or SUPABASE_SERVICE_KEY is missing from environment variables')
@@ -576,6 +586,39 @@ const onboardingSetupSchema = z.object({
   customPersonalityTags: z.array(z.string()).optional(),
   avatarData: z.string().optional(),
   packs: z.array(z.string()).optional(),
+})
+
+/**
+ * GET /auth/supabase-config
+ * Public Realtime credentials for mobile (anon key only — never service_role).
+ */
+router.get('/supabase-config', async (_req: Request, res: Response): Promise<void> => {
+  if (!supabaseUrl || !supabaseAnonKey) {
+    res.status(503).json({ error: 'Supabase anon config is not set on the server' })
+    return
+  }
+
+  if (jwtRole(supabaseAnonKey) === 'service_role') {
+    console.error('[auth] SUPABASE_ANON_KEY is a service_role key — refusing to expose it')
+    res.status(503).json({ error: 'Supabase anon config is not set on the server' })
+    return
+  }
+
+  res.status(200).json({ supabaseUrl, supabaseAnonKey })
+})
+
+/**
+ * GET /auth/realtime-session
+ * Access/refresh tokens so the browser can authenticate the Realtime socket.
+ */
+router.get('/realtime-session', async (req: Request, res: Response): Promise<void> => {
+  const access_token = getAccessToken(req)
+  const refresh_token = getCookie(req, 'furlo_refresh')
+  if (!access_token || !refresh_token) {
+    res.status(401).json({ error: 'Unauthorized' })
+    return
+  }
+  res.status(200).json({ access_token, refresh_token })
 })
 
 /**

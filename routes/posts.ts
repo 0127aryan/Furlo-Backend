@@ -41,24 +41,24 @@ function tallyByPostId(rows: { post_id: string }[] | null): Map<string, number> 
   return counts
 }
 
-async function recountLikes(supabase: ReturnType<typeof createClient>, postId: string): Promise<number> {
+async function recountLikes(supabase: any, postId: string): Promise<number> {
   const { count } = await supabase
     .from('likes')
     .select('id', { count: 'exact', head: true })
     .eq('post_id', postId)
   const likeCount = count ?? 0
-  await supabase.from('posts').update({ like_count: likeCount }).eq('id', postId)
+  await (supabase.from('posts') as any).update({ like_count: likeCount }).eq('id', postId)
   return likeCount
 }
 
-async function recountComments(supabase: ReturnType<typeof createClient>, postId: string): Promise<number> {
+async function recountComments(supabase: any, postId: string): Promise<number> {
   const { count } = await supabase
     .from('comments')
     .select('id', { count: 'exact', head: true })
     .eq('post_id', postId)
     .eq('status', 'active')
   const commentCount = count ?? 0
-  await supabase.from('posts').update({ comment_count: commentCount }).eq('id', postId)
+  await (supabase.from('posts') as any).update({ comment_count: commentCount }).eq('id', postId)
   return commentCount
 }
 
@@ -149,18 +149,18 @@ router.get('/feed', async (req: Request, res: Response): Promise<void> => {
     const [likeRows, commentRows, myLikes] = await Promise.all([
       postIds.length
         ? supabase.from('likes').select('post_id').in('post_id', postIds)
-        : Promise.resolve({ data: [] as { post_id: string }[] }),
+        : Promise.resolve({ data: [] as { post_id: string }[], error: null }),
       postIds.length
         ? supabase.from('comments').select('post_id').eq('status', 'active').in('post_id', postIds)
-        : Promise.resolve({ data: [] as { post_id: string }[] }),
+        : Promise.resolve({ data: [] as { post_id: string }[], error: null }),
       activePetId
         ? supabase.from('likes').select('post_id').eq('pet_id', activePetId)
-        : Promise.resolve({ data: [] as { post_id: string }[] }),
+        : Promise.resolve({ data: [] as { post_id: string }[], error: null }),
     ])
 
-    const likeCounts = likeRows.error ? null : tallyByPostId(likeRows.data)
-    const commentCounts = commentRows.error ? null : tallyByPostId(commentRows.data)
-    const likedPostIds = new Set((myLikes.data || []).map((row) => row.post_id))
+    const likeCounts = (likeRows as any).error ? null : tallyByPostId((likeRows as any).data)
+    const commentCounts = (commentRows as any).error ? null : tallyByPostId((commentRows as any).data)
+    const likedPostIds = new Set(((myLikes as any).data || []).map((row: { post_id: string }) => row.post_id))
 
     const formattedPosts = posts?.map((post) => ({
       ...post,
@@ -424,13 +424,13 @@ router.post('/:id/like', async (req: Request, res: Response): Promise<void> => {
       return
     }
 
-    const { petId } = req.body
+    const petId = String(req.body.petId || '')
     if (!petId) {
       res.status(400).json({ error: 'petId is required' })
       return
     }
 
-    const postId = req.params.id
+    const postId = String(req.params.id)
     const supabase = createClient(supabaseUrl!, supabaseServiceKey!)
 
     // Check if already liked
@@ -524,7 +524,7 @@ router.post('/:id/comments', async (req: Request, res: Response): Promise<void> 
       return
     }
 
-    const postId = req.params.id
+    const postId = String(req.params.id)
     const supabase = createClient(supabaseUrl!, supabaseServiceKey!)
 
     const { petId, content, parentCommentId } = parsed.data

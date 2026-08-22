@@ -1,6 +1,7 @@
 import { Router, Request, Response } from "express";
 import { createClient } from "@supabase/supabase-js";
 import { z } from "zod";
+import { broadcastFollow, broadcastWag } from "../lib/feedBroadcast.js";
 
 const router = Router();
 
@@ -1331,7 +1332,7 @@ router.get("/pet/:id", async (req: Request, res: Response): Promise<void> => {
       0,
     );
 
-    const [followsRes, followingRes, commRes] = await Promise.all([
+    const [followsRes, followingRes] = await Promise.all([
       (async () => {
         try {
           const r = await supabase
@@ -1354,21 +1355,23 @@ router.get("/pet/:id", async (req: Request, res: Response): Promise<void> => {
           return 0;
         }
       })(),
-      (async () => {
-        try {
-          const r = await supabase
-            .from("community_members")
-            .select("id", { count: "exact", head: true })
-            .eq("pet_id", petRecord.id);
-          return r.count ?? 0;
-        } catch {
-          return 0;
-        }
-      })(),
     ]);
 
-    const packMembersCount = (followsRes || 0) + (commRes || 0);
+    const packMembersCount = followsRes || 0;
     const followingCount = followingRes || 0;
+
+    let isFollowing = false;
+    const viewerPetId =
+      typeof req.query.viewerPetId === "string" ? req.query.viewerPetId : "";
+    if (viewerPetId && viewerPetId !== petRecord.id) {
+      const { data: followRow } = await supabase
+        .from("follows")
+        .select("id")
+        .eq("follower_pet_id", viewerPetId)
+        .eq("following_pet_id", petRecord.id)
+        .maybeSingle();
+      isFollowing = Boolean(followRow);
+    }
 
     res.status(200).json({
       pet,
@@ -1378,11 +1381,392 @@ router.get("/pet/:id", async (req: Request, res: Response): Promise<void> => {
         packMembersCount,
         followingCount,
         treatsCount,
+        isFollowing,
       },
     });
   } catch (err) {
     console.error("[auth] Get pet profile error:", err);
     res.status(500).json({ error: "Failed to fetch pet profile" });
+  }
+});
+
+/**
+ * POST /auth/follow-pet
+ * Toggle follow/unfollow status for a pet profile
+ */
+router.post("/follow-pet", async (req: Request, res: Response): Promise<void> => {
+  try {
+    const accessToken = getAccessToken(req);
+    if (!accessToken) {
+      res.status(401).json({ error: "Unauthorized" });
+      return;
+    }
+
+    const { targetPetId, followerPetId } = req.body;
+    if (!targetPetId) {
+      res.status(400).json({ error: "Target pet ID is required" });
+      return;
+    }
+
+    const supabase = createClient(supabaseUrl!, supabaseServiceKey!);
+    const {
+      data: { user },
+      error: authError,
+    } = await supabase.auth.getUser(accessToken);
+
+    if (authError || !user) {
+      res.status(401).json({ error: "Invalid session" });
+      return;
+    }
+
+    let activeFollowerId = followerPetId;
+    if (!activeFollowerId) {
+      const { data: myPets } = await supabase
+        .from("pets")
+        .select("id")
+        .eq("owner_id", user.id)
+        .limit(1);
+
+      if (myPets && myPets.length > 0) {
+        activeFollowerId = myPets[0].id;
+      }
+    }
+
+    if (!activeFollowerId) {
+      res.status(400).json({ error: "No active pet profile found to follow with" });
+      return;
+    }
+
+    if (activeFollowerId === targetPetId) {
+      res.status(400).json({ error: "You cannot follow your own pet profile" });
+      return;
+    }
+
+    const { data: existingFollow } = await supabase
+      .from("follows")
+      .select("id")
+      .eq("follower_pet_id", activeFollowerId)
+      .eq("following_pet_id", targetPetId)
+      .maybeSingle();
+
+    let isFollowing = false;
+
+    if (existingFollow) {
+      await supabase.from("follows").delete().eq("id", existingFollow.id);
+      isFollowing = false;
+    } else {
+      await supabase.from("follows").insert({
+        follower_pet_id: activeFollowerId,
+        following_pet_id: targetPetId,
+      });
+      isFollowing = true;
+    }
+
+    const [{ count: packMembersCount }, { count: followingCount }] =
+      await Promise.all([
+        supabase
+          .from("follows")
+          .select("id", { count: "exact", head: true })
+          .eq("following_pet_id", targetPetId),
+        supabase
+          .from("follows")
+          .select("id", { count: "exact", head: true })
+          .eq("follower_pet_id", activeFollowerId),
+      ]);
+
+    const payload = {
+      targetPetId,
+      followerPetId: activeFollowerId,
+      following: isFollowing,
+      packMembersCount: packMembersCount ?? 0,
+      followingCount: followingCount ?? 0,
+    };
+
+    await broadcastFollow(payload).catch((err) => {
+      console.error("[auth] Follow broadcast failed:", err);
+    });
+
+    res.status(200).json({
+      success: true,
+      ...payload,
+    });
+  } catch (err) {
+    console.error("[auth] Follow pet error:", err);
+    res.status(500).json({ error: "Failed to update follow status" });
+  }
+});
+
+/**
+ * GET /auth/pet/:id/pack-members
+ * Fetch list of follower pet profiles for pack members modal
+ */
+router.get("/pet/:id/pack-members", async (req: Request, res: Response): Promise<void> => {
+  try {
+    const petId = String(req.params.id);
+    const supabase = createClient(supabaseUrl!, supabaseServiceKey!);
+
+    const { data: follows, error } = await supabase
+      .from("follows")
+      .select("follower_pet:follower_pet_id (id, name, username, breed, city, profile_image_url)")
+      .eq("following_pet_id", petId);
+
+    if (error) {
+      res.status(500).json({ error: "Failed to fetch pack members" });
+      return;
+    }
+
+    const members = (follows || [])
+      .map((f: any) => {
+        const pet = f.follower_pet;
+        return Array.isArray(pet) ? pet[0] : pet;
+      })
+      .filter(Boolean);
+    res.status(200).json({ members });
+  } catch (err) {
+    console.error("[auth] Pack members fetch error:", err);
+    res.status(500).json({ error: "Failed to fetch pack members" });
+  }
+});
+
+/**
+ * GET /auth/pet/:id/following
+ * Fetch list of pet profiles that this pet is following
+ */
+router.get("/pet/:id/following", async (req: Request, res: Response): Promise<void> => {
+  try {
+    const petId = String(req.params.id);
+    const supabase = createClient(supabaseUrl!, supabaseServiceKey!);
+
+    const { data: follows, error } = await supabase
+      .from("follows")
+      .select("following_pet:following_pet_id (id, name, username, breed, city, profile_image_url)")
+      .eq("follower_pet_id", petId);
+
+    if (error) {
+      res.status(500).json({ error: "Failed to fetch following list" });
+      return;
+    }
+
+    const members = (follows || [])
+      .map((f: any) => {
+        const pet = f.following_pet;
+        return Array.isArray(pet) ? pet[0] : pet;
+      })
+      .filter(Boolean);
+    res.status(200).json({ following: members, members, count: members.length });
+  } catch (err) {
+    console.error("[auth] Following fetch error:", err);
+    res.status(500).json({ error: "Failed to fetch following list" });
+  }
+});
+
+/**
+ * GET /auth/pet/:id/following
+ * Pets this profile follows (Following stat list)
+ */
+router.get("/pet/:id/following", async (req: Request, res: Response): Promise<void> => {
+  try {
+    const petId = String(req.params.id);
+    const supabase = createClient(supabaseUrl!, supabaseServiceKey!);
+
+    const { data: follows, error } = await supabase
+      .from("follows")
+      .select("following_pet:following_pet_id (id, name, username, breed, city, profile_image_url)")
+      .eq("follower_pet_id", petId);
+
+    if (error) {
+      res.status(500).json({ error: "Failed to fetch following" });
+      return;
+    }
+
+    const members = (follows || [])
+      .map((f: any) => {
+        const pet = f.following_pet;
+        return Array.isArray(pet) ? pet[0] : pet;
+      })
+      .filter(Boolean);
+    res.status(200).json({ members });
+  } catch (err) {
+    console.error("[auth] Following fetch error:", err);
+    res.status(500).json({ error: "Failed to fetch following" });
+  }
+});
+
+/**
+ * POST /auth/send-wag
+ * Send a tail wag interaction to a pet profile
+ */
+router.post("/send-wag", async (req: Request, res: Response): Promise<void> => {
+  try {
+    const accessToken = getAccessToken(req);
+    if (!accessToken) {
+      res.status(401).json({ error: "Unauthorized" });
+      return;
+    }
+
+    const { targetPetId, senderPetId } = req.body;
+    if (!targetPetId) {
+      res.status(400).json({ error: "Target pet ID is required" });
+      return;
+    }
+
+    const supabase = createClient(supabaseUrl!, supabaseServiceKey!);
+    const {
+      data: { user },
+      error: authError,
+    } = await supabase.auth.getUser(accessToken);
+
+    if (authError || !user) {
+      res.status(401).json({ error: "Invalid session" });
+      return;
+    }
+
+    let activeSenderId = senderPetId;
+    if (!activeSenderId) {
+      const { data: myPets } = await supabase
+        .from("pets")
+        .select("id")
+        .eq("owner_id", user.id)
+        .limit(1);
+
+      if (myPets && myPets.length > 0) {
+        activeSenderId = myPets[0].id;
+      }
+    }
+
+    if (!activeSenderId) {
+      res.status(400).json({ error: "No active pet profile found to send a wag" });
+      return;
+    }
+
+    if (activeSenderId === targetPetId) {
+      res.status(400).json({ error: "You cannot send a wag to your own pet" });
+      return;
+    }
+
+    const { data: inserted, error: insertError } = await supabase
+      .from("wags")
+      .insert({
+        sender_pet_id: activeSenderId,
+        target_pet_id: targetPetId,
+        message: "Wagged at your profile! 🐾",
+        created_at: new Date().toISOString(),
+      })
+      .select("id, created_at, message")
+      .maybeSingle();
+
+    if (insertError) {
+      console.warn("[auth] Wag insert:", insertError.message);
+    }
+
+    const { data: senderPets } = await supabase
+      .from("pets")
+      .select("id, name, username, breed, profile_image_url")
+      .eq("id", activeSenderId)
+      .limit(1);
+    const sender = senderPets && senderPets.length > 0 ? senderPets[0] : null;
+
+    const wagId = inserted?.id || `wag-${Date.now()}`;
+    const createdAt = inserted?.created_at || new Date().toISOString();
+
+    await broadcastWag({
+      id: wagId,
+      targetPetId,
+      senderPetId: activeSenderId,
+      senderName: sender?.name,
+      senderUsername: sender?.username,
+      senderAvatar: sender?.profile_image_url,
+      senderBreed: sender?.breed,
+      created_at: createdAt,
+      message: inserted?.message || "Wagged at your profile! 🐾",
+    }).catch((err) => {
+      console.error("[auth] Wag broadcast failed:", err);
+    });
+
+    res.status(200).json({
+      success: true,
+      message: "Wag sent successfully! 🐾",
+      targetPetId,
+      senderPetId: activeSenderId,
+    });
+  } catch (err) {
+    console.error("[auth] Send wag error:", err);
+    res.status(500).json({ error: "Failed to send wag" });
+  }
+});
+
+/**
+ * GET /auth/wags
+ * Tail wags received by a pet (Alerts inbox)
+ */
+router.get("/wags", async (req: Request, res: Response): Promise<void> => {
+  try {
+    const accessToken = getAccessToken(req);
+    if (!accessToken) {
+      res.status(401).json({ error: "Unauthorized" });
+      return;
+    }
+
+    const supabase = createClient(supabaseUrl!, supabaseServiceKey!);
+    const {
+      data: { user },
+      error: authError,
+    } = await supabase.auth.getUser(accessToken);
+
+    if (authError || !user) {
+      res.status(401).json({ error: "Invalid session" });
+      return;
+    }
+
+    let petId = typeof req.query.petId === "string" ? req.query.petId : "";
+    if (!petId) {
+      const { data: myPets } = await supabase
+        .from("pets")
+        .select("id")
+        .eq("owner_id", user.id)
+        .limit(1);
+      petId = myPets && myPets.length > 0 ? myPets[0].id : "";
+    }
+
+    if (!petId) {
+      res.status(200).json({ wags: [] });
+      return;
+    }
+
+    const { data: rows, error } = await supabase
+      .from("wags")
+      .select(
+        "id, created_at, message, sender_pet:sender_pet_id (id, name, username, breed, profile_image_url)",
+      )
+      .eq("target_pet_id", petId)
+      .order("created_at", { ascending: false })
+      .limit(50);
+
+    if (error) {
+      console.warn("[auth] Fetch wags:", error.message);
+      res.status(200).json({ wags: [] });
+      return;
+    }
+
+    const wags = (rows || [])
+      .map((row: any) => {
+        const sender = Array.isArray(row.sender_pet)
+          ? row.sender_pet[0]
+          : row.sender_pet;
+        if (!sender?.id) return null;
+        return {
+          id: row.id,
+          created_at: row.created_at,
+          message: row.message,
+          sender,
+        };
+      })
+      .filter(Boolean);
+
+    res.status(200).json({ wags });
+  } catch (err) {
+    console.error("[auth] Fetch wags error:", err);
+    res.status(500).json({ error: "Failed to fetch wags" });
   }
 });
 

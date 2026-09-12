@@ -3,6 +3,7 @@ import { createClient } from "@supabase/supabase-js";
 import dotenv from "dotenv";
 import { z } from "zod";
 import { broadcastFeedCounts, broadcastNewPost } from "../lib/feedBroadcast.js";
+import { attachPetType } from "../lib/inferPetType.js";
 
 dotenv.config();
 
@@ -54,7 +55,7 @@ async function recountLikes(
     .eq("post_id", postId);
   const likeCount = count ?? 0;
   await (supabase.from("posts") as any)
-    .update({ like_count: likeCount })
+    .update({ like_count: likeCount, updated_at: new Date().toISOString() })
     .eq("id", postId);
   return likeCount;
 }
@@ -121,9 +122,9 @@ router.get("/feed", async (req: Request, res: Response): Promise<void> => {
     }
 
     const activePetId = req.query.petId as string;
+    const communityId = String(req.query.communityId || "").trim();
 
-    // Fetch active posts with author pet info and community info
-    const { data: posts, error } = await supabase
+    let feedQuery = supabase
       .from("posts")
       .select(
         `
@@ -155,7 +156,13 @@ router.get("/feed", async (req: Request, res: Response): Promise<void> => {
         )
       `,
       )
-      .eq("status", "active")
+      .eq("status", "active");
+
+    if (communityId) {
+      feedQuery = feedQuery.eq("community_id", communityId);
+    }
+
+    const { data: posts, error } = await feedQuery
       .order("created_at", { ascending: false })
       .limit(30);
 
@@ -192,6 +199,7 @@ router.get("/feed", async (req: Request, res: Response): Promise<void> => {
 
     const formattedPosts = posts?.map((post) => ({
       ...post,
+      pets: attachPetType(post.pets as { breed?: string; pet_type?: string }),
       like_count: likeCounts ? likeCounts.get(post.id) || 0 : post.like_count,
       comment_count: commentCounts
         ? commentCounts.get(post.id) || 0
@@ -450,6 +458,7 @@ router.post("/create", async (req: Request, res: Response): Promise<void> => {
 
     const createdPost = {
       ...newPost,
+      pets: attachPetType(newPost.pets as { breed?: string; pet_type?: string }),
       hasLiked: false,
       media: insertedMedia
         .filter(

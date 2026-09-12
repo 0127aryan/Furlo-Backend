@@ -4,6 +4,7 @@ import cors from 'cors'
 import authRouter from './routes/auth.js'
 import adminRouter from './routes/admin.js'
 import postsRouter from './routes/posts.js'
+import communitiesRouter from './routes/communities.js'
 
 const app = express()
 const port = process.env.PORT ?? 4000
@@ -40,6 +41,7 @@ app.get('/health', (_req, res) => {
 app.use('/auth', authRouter)
 app.use('/admin', adminRouter)
 app.use('/posts', postsRouter)
+app.use('/communities', communitiesRouter)
 
 // Only listen if not running as a Vercel serverless function
 if (process.env.NODE_ENV !== 'production' || !process.env.VERCEL) {

@@ -219,4 +219,150 @@ router.delete('/species-verbs/:id', async (req: Request, res: Response): Promise
   }
 })
 
+/**
+ * GET /admin/pending-communities
+ * Fetch communities awaiting super admin approval
+ */
+router.get('/pending-communities', async (_req: Request, res: Response): Promise<void> => {
+  try {
+    const supabase = createClient(supabaseUrl!, supabaseServiceKey!)
+    const { data, error } = await supabase
+      .from('communities')
+      .select('*')
+      .or('status.eq.pending,is_approved.eq.false')
+      .order('created_at', { ascending: false })
+
+    if (error) {
+      const retry = await supabase
+        .from('communities')
+        .select('*')
+        .order('created_at', { ascending: false })
+      res.status(200).json(retry.data || [])
+      return
+    }
+
+    res.status(200).json(data || [])
+  } catch (err) {
+    console.error('[admin] Error fetching pending communities:', err)
+    res.status(500).json({ error: 'Failed to fetch pending community requests' })
+  }
+})
+
+/**
+ * POST /admin/approve-community
+ * Super admin approval of a community request — activates community, sets category, and awards Verified Badge
+ */
+router.post('/approve-community', async (req: Request, res: Response): Promise<void> => {
+  try {
+    const { communityId } = req.body
+    if (!communityId) {
+      res.status(400).json({ error: 'communityId is required' })
+      return
+    }
+
+    const supabase = createClient(supabaseUrl!, supabaseServiceKey!)
+
+    // Fetch existing requested_category or category
+    const { data: communityRecord } = await supabase
+      .from('communities')
+      .select('category, requested_category')
+      .eq('id', communityId)
+      .single()
+
+    const finalCategory = communityRecord?.requested_category || communityRecord?.category || 'General'
+
+    let { data, error } = await supabase
+      .from('communities')
+      .update({
+        status: 'approved',
+        is_approved: true,
+        is_verified: true,
+        is_active: true,
+        category: finalCategory,
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', communityId)
+      .select()
+      .single()
+
+    if (error) {
+      const fallback = await supabase
+        .from('communities')
+        .update({
+          is_active: true,
+          updated_at: new Date().toISOString(),
+        })
+        .eq('id', communityId)
+        .select()
+        .single()
+      data = fallback.data
+      error = fallback.error
+    }
+
+    if (error) {
+      res.status(500).json({ error: error.message })
+      return
+    }
+
+    res.status(200).json({
+      message: 'Community approved and verified badge granted! 🐾',
+      community: data,
+    })
+  } catch (err) {
+    console.error('[admin] Error approving community:', err)
+    res.status(500).json({ error: 'Failed to approve community' })
+  }
+})
+
+/**
+ * POST /admin/reject-community
+ * Reject a community request
+ */
+router.post('/reject-community', async (req: Request, res: Response): Promise<void> => {
+  try {
+    const { communityId } = req.body
+    if (!communityId) {
+      res.status(400).json({ error: 'communityId is required' })
+      return
+    }
+
+    const supabase = createClient(supabaseUrl!, supabaseServiceKey!)
+    let { data, error } = await supabase
+      .from('communities')
+      .update({
+        status: 'rejected',
+        is_approved: false,
+        is_active: false,
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', communityId)
+      .select()
+      .single()
+
+    if (error) {
+      const fallback = await supabase
+        .from('communities')
+        .update({
+          is_active: false,
+          updated_at: new Date().toISOString(),
+        })
+        .eq('id', communityId)
+        .select()
+        .single()
+      data = fallback.data
+      error = fallback.error
+    }
+
+    if (error) {
+      res.status(500).json({ error: error.message })
+      return
+    }
+
+    res.status(200).json({ message: 'Community request rejected.', community: data })
+  } catch (err) {
+    console.error('[admin] Error rejecting community:', err)
+    res.status(500).json({ error: 'Failed to reject community' })
+  }
+})
+
 export default router

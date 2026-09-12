@@ -170,7 +170,7 @@ router.get("/categories", async (_req: Request, res: Response): Promise<void> =>
     if (error) {
       const retry = await supabase
         .from("communities")
-        .select("category")
+        .select("category, status, is_approved, is_verified")
         .eq("is_active", true);
       data = retry.data;
     }

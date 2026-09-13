@@ -365,4 +365,22 @@ router.post('/reject-community', async (req: Request, res: Response): Promise<vo
   }
 })
 
+/**
+ * ALL /admin/migrate
+ * Run database SQL migrations programmatically via API endpoint
+ */
+router.all('/migrate', async (_req: Request, res: Response): Promise<void> => {
+  try {
+    const { runMigrations } = await import('../scripts/migrate.js')
+    const result = await runMigrations()
+    res.status(200).json({
+      message: 'Database migrations completed successfully! 🚀',
+      result,
+    })
+  } catch (err: any) {
+    console.error('[admin] Migration API error:', err)
+    res.status(500).json({ error: err?.message || 'Database migration failed' })
+  }
+})
+
 export default router

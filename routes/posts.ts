@@ -83,6 +83,7 @@ const createPostSchema = z.object({
   postType: z
     .enum(["regular", "question", "advice", "meme"])
     .default("regular"),
+  topicCategory: z.string().optional().nullable(),
   mediaData: z.array(z.string()).optional(), // base64 strings or URLs
 });
 
@@ -131,6 +132,9 @@ router.get("/feed", async (req: Request, res: Response): Promise<void> => {
         id,
         caption,
         post_type,
+        topic_category,
+        is_solved,
+        accepted_answer_id,
         location_city,
         like_count,
         comment_count,
@@ -339,7 +343,7 @@ router.post("/create", async (req: Request, res: Response): Promise<void> => {
       return;
     }
 
-    const { petId, communityId, caption, postType, mediaData } = parsed.data;
+    const { petId, communityId, caption, postType, topicCategory, mediaData } = parsed.data;
 
     // Verify user owns the pet
     const { data: pet } = await supabase
@@ -362,6 +366,8 @@ router.post("/create", async (req: Request, res: Response): Promise<void> => {
         community_id: communityId || null,
         caption: caption || "",
         post_type: postType,
+        topic_category: topicCategory || null,
+        is_solved: false,
         location_city: pet.city || "Bangalore",
         status: "active",
       })
@@ -370,6 +376,9 @@ router.post("/create", async (req: Request, res: Response): Promise<void> => {
         id,
         caption,
         post_type,
+        topic_category,
+        is_solved,
+        accepted_answer_id,
         location_city,
         like_count,
         comment_count,
@@ -762,6 +771,641 @@ router.delete("/:id", async (req: Request, res: Response): Promise<void> => {
   } catch (err) {
     console.error("[posts] Delete post error:", err);
     res.status(500).json({ error: "Failed to delete post" });
+  }
+});
+
+/**
+ * GET /posts/qa/questions
+ * Filterable Q&A Hub feed endpoint
+ */
+router.get("/qa/questions", async (req: Request, res: Response): Promise<void> => {
+  try {
+    const supabase = createClient(supabaseUrl!, supabaseServiceKey!);
+    const category = String(req.query.category || "").trim();
+    const unanswered = req.query.unanswered === "true";
+    const filter = String(req.query.filter || "all").trim().toLowerCase();
+    const search = String(req.query.search || "").trim();
+    const petId = req.query.petId as string | undefined;
+
+    let query = supabase
+      .from("posts")
+      .select(
+        `
+        id,
+        caption,
+        post_type,
+        topic_category,
+        is_solved,
+        accepted_answer_id,
+        location_city,
+        like_count,
+        comment_count,
+        status,
+        created_at,
+        pets:pet_id (
+          id,
+          name,
+          username,
+          breed,
+          city,
+          profile_image_url
+        ),
+        post_media (
+          id,
+          media_url,
+          display_order
+        )
+      `
+      )
+      .eq("status", "active")
+      .eq("post_type", "question");
+
+    if (category && category !== "All Questions") {
+      query = query.ilike("topic_category", `%${category}%`);
+    }
+
+    if (unanswered) {
+      query = query.eq("comment_count", 0);
+    }
+
+    if (filter === "solved") {
+      query = query.eq("is_solved", true);
+    } else if (filter === "unanswered") {
+      query = query.eq("is_solved", false);
+    }
+
+    if (search) {
+      query = query.or(`caption.ilike.%${search}%,topic_category.ilike.%${search}%`);
+    }
+
+    const { data: questions, error } = await query
+      .order("created_at", { ascending: false })
+      .limit(30);
+
+    if (error) {
+      console.error("[posts] Q&A query error:", error.message);
+      res.status(500).json({ error: error.message });
+      return;
+    }
+
+    const postIds = (questions || []).map((q) => q.id);
+    const acceptedAnswerIds = (questions || [])
+      .map((q) => q.accepted_answer_id)
+      .filter(Boolean);
+
+    let acceptedAnswersMap = new Map<string, any>();
+    if (acceptedAnswerIds.length > 0) {
+      const { data: answers } = await supabase
+        .from("comments")
+        .select(
+          `
+          id,
+          content,
+          created_at,
+          pets:pet_id (
+            id,
+            name,
+            username,
+            profile_image_url
+          )
+        `
+        )
+        .in("id", acceptedAnswerIds);
+
+      for (const a of answers || []) {
+        acceptedAnswersMap.set(a.id, a);
+      }
+    }
+
+    let likedPostIds = new Set<string>();
+    if (petId && postIds.length > 0) {
+      const { data: myLikes } = await supabase
+        .from("likes")
+        .select("post_id")
+        .eq("pet_id", petId)
+        .in("post_id", postIds);
+      (myLikes || []).forEach((row) => likedPostIds.add(row.post_id));
+    }
+
+    const formattedQuestions = (questions || []).map((q) => ({
+      ...q,
+      pets: attachPetType(q.pets as any),
+      hasLiked: likedPostIds.has(q.id),
+      accepted_answer: q.accepted_answer_id ? acceptedAnswersMap.get(q.accepted_answer_id) || null : null,
+      media: q.post_media?.sort((a, b) => a.display_order - b.display_order) || [],
+    }));
+
+    res.status(200).json({ questions: formattedQuestions });
+  } catch (err) {
+    console.error("[posts] Q&A Hub error:", err);
+    res.status(500).json({ error: "Failed to fetch Q&A questions" });
+  }
+});
+
+/**
+ * GET /posts/qa/trending
+ * Top trending questions for Q&A right sidebar (computed live from DB)
+ */
+router.get("/qa/trending", async (_req: Request, res: Response): Promise<void> => {
+  try {
+    const supabase = createClient(supabaseUrl!, supabaseServiceKey!);
+    const { data: questions } = await supabase
+      .from("posts")
+      .select("id, caption, like_count, comment_count, created_at")
+      .eq("status", "active")
+      .eq("post_type", "question")
+      .order("comment_count", { ascending: false })
+      .order("like_count", { ascending: false })
+      .order("created_at", { ascending: false })
+      .limit(5);
+
+    res.status(200).json({ trending: questions || [] });
+  } catch (err) {
+    res.status(200).json({ trending: [] });
+  }
+});
+
+/**
+ * GET /posts/qa/top-helpers
+ * Leaderboard for most helpful pets calculated dynamically ONLY from Q&A posts and answers
+ */
+router.get("/qa/top-helpers", async (_req: Request, res: Response): Promise<void> => {
+  try {
+    const supabase = createClient(supabaseUrl!, supabaseServiceKey!);
+
+    // 1. Fetch all active Q&A question post IDs
+    const { data: qaPosts } = await supabase
+      .from("posts")
+      .select("id, pet_id, accepted_answer_id, like_count")
+      .eq("status", "active")
+      .eq("post_type", "question");
+
+    const qaPostIds = (qaPosts || []).map((p) => p.id);
+    const acceptedAnswerIds = new Set((qaPosts || []).map((p) => p.accepted_answer_id).filter(Boolean));
+
+    const petScores = new Map<string, number>();
+
+    // Add points for Q&A question authors receiving treats/likes on their questions
+    for (const p of qaPosts || []) {
+      if (p.pet_id && (p.like_count || 0) > 0) {
+        petScores.set(p.pet_id, (petScores.get(p.pet_id) || 0) + p.like_count);
+      }
+    }
+
+    // 2. Fetch all comments on Q&A posts only
+    if (qaPostIds.length > 0) {
+      const { data: qaComments } = await supabase
+        .from("comments")
+        .select("id, pet_id, is_accepted_answer, like_count")
+        .eq("status", "active")
+        .in("post_id", qaPostIds);
+
+      for (const c of qaComments || []) {
+        if (!c.pet_id) continue;
+        const isAccepted = c.is_accepted_answer || acceptedAnswerIds.has(c.id);
+        // 1 point for answering a Q&A, 10 bonus points for accepted best answer, plus treats received
+        const score = 1 + (isAccepted ? 10 : 0) + (c.like_count || 0);
+        petScores.set(c.pet_id, (petScores.get(c.pet_id) || 0) + score);
+      }
+    }
+
+    // 3. Sort pet IDs by score descending (only pets with score > 0 get ranked top)
+    const sortedEntries = Array.from(petScores.entries())
+      .filter(([_, score]) => score > 0)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 5);
+
+    const sortedPetIds = sortedEntries.map(([id]) => id);
+
+    let pets: any[] = [];
+    if (sortedPetIds.length > 0) {
+      const { data: petRows } = await supabase
+        .from("pets")
+        .select("id, name, username, profile_image_url")
+        .in("id", sortedPetIds);
+
+      const petMap = new Map((petRows || []).map((p) => [p.id, p]));
+      pets = sortedEntries
+        .map(([id, score], idx) => {
+          const pet = petMap.get(id);
+          if (!pet) return null;
+          return {
+            ...pet,
+            rank: idx + 1,
+            helpful_count: score,
+          };
+        })
+        .filter(Boolean);
+    }
+
+    res.status(200).json({ helpers: pets });
+  } catch (err) {
+    console.error("[posts] top-helpers error:", err);
+    res.status(200).json({ helpers: [] });
+  }
+});
+
+/**
+ * GET /posts/single/:id
+ * Get single post details including question & accepted answer metadata
+ */
+router.get("/single/:id", async (req: Request, res: Response): Promise<void> => {
+  try {
+    const postId = req.params.id;
+    const activePetId = req.query.petId as string | undefined;
+    const supabase = createClient(supabaseUrl!, supabaseServiceKey!);
+
+    const { data: post, error } = await supabase
+      .from("posts")
+      .select(
+        `
+        id,
+        caption,
+        post_type,
+        topic_category,
+        is_solved,
+        accepted_answer_id,
+        location_city,
+        like_count,
+        comment_count,
+        status,
+        created_at,
+        pets:pet_id (
+          id,
+          name,
+          username,
+          breed,
+          city,
+          profile_image_url
+        ),
+        communities:community_id (
+          id,
+          name,
+          slug
+        ),
+        post_media (
+          id,
+          media_url,
+          display_order
+        )
+      `
+      )
+      .eq("id", postId)
+      .single();
+
+    if (error || !post) {
+      res.status(404).json({ error: "Post not found" });
+      return;
+    }
+
+    let hasLiked = false;
+    if (activePetId) {
+      const { data: like } = await supabase
+        .from("likes")
+        .select("id")
+        .eq("post_id", postId)
+        .eq("pet_id", activePetId)
+        .single();
+      hasLiked = Boolean(like);
+    }
+
+    let acceptedAnswer = null;
+    if (post.accepted_answer_id) {
+      const { data: comment } = await supabase
+        .from("comments")
+        .select(
+          `
+          id,
+          content,
+          created_at,
+          pets:pet_id (
+            id,
+            name,
+            username,
+            profile_image_url,
+            breed
+          )
+        `
+        )
+        .eq("id", post.accepted_answer_id)
+        .single();
+      acceptedAnswer = comment;
+    }
+
+    const formattedPost = {
+      ...post,
+      pets: attachPetType(post.pets as any),
+      hasLiked,
+      accepted_answer: acceptedAnswer,
+      media: post.post_media?.sort((a, b) => a.display_order - b.display_order) || [],
+    };
+
+    res.status(200).json({ post: formattedPost });
+  } catch (err) {
+    console.error("[posts] Single post error:", err);
+    res.status(500).json({ error: "Failed to fetch post details" });
+  }
+});
+
+/**
+ * POST /posts/:id/accept-answer
+ * Mark an answer comment as accepted best answer
+ */
+router.post("/:id/accept-answer", async (req: Request, res: Response): Promise<void> => {
+  try {
+    const accessToken = getAccessToken(req);
+    if (!accessToken) {
+      res.status(401).json({ error: "Unauthorized" });
+      return;
+    }
+
+    const postId = req.params.id;
+    const { commentId, petId } = req.body;
+
+    if (!commentId || !petId) {
+      res.status(400).json({ error: "commentId and petId are required" });
+      return;
+    }
+
+    const supabase = createClient(supabaseUrl!, supabaseServiceKey!);
+
+    // Verify user owns pet
+    const { data: { user } } = await supabase.auth.getUser(accessToken);
+    if (!user) {
+      res.status(401).json({ error: "Invalid session" });
+      return;
+    }
+
+    const { data: pet } = await supabase
+      .from("pets")
+      .select("id")
+      .eq("id", petId)
+      .eq("owner_id", user.id)
+      .single();
+
+    if (!pet) {
+      res.status(403).json({ error: "Forbidden: You do not own this pet profile" });
+      return;
+    }
+
+    // Check post ownership
+    const { data: post } = await supabase
+      .from("posts")
+      .select("id, pet_id, accepted_answer_id")
+      .eq("id", postId)
+      .single();
+
+    if (!post || post.pet_id !== petId) {
+      res.status(403).json({ error: "Forbidden: Only the question author can accept a best answer" });
+      return;
+    }
+
+    // Reset old accepted answer comments if any
+    try {
+      await (supabase.from("comments") as any)
+        .update({ is_accepted_answer: false })
+        .eq("post_id", postId);
+    } catch {
+      // Ignored if column optional
+    }
+
+    // Set accepted_answer_id only — is_solved is managed separately
+    await (supabase.from("posts") as any)
+      .update({
+        accepted_answer_id: commentId,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", postId);
+
+    // Mark comment as accepted answer
+    try {
+      await (supabase.from("comments") as any)
+        .update({ is_accepted_answer: true })
+        .eq("id", commentId);
+    } catch {
+      // Ignored if column optional
+    }
+
+    res.status(200).json({ success: true, message: "Marked as accepted answer" });
+  } catch (err) {
+    console.error("[posts] Accept answer error:", err);
+    res.status(500).json({ error: "Failed to accept answer" });
+  }
+});
+
+/**
+ * POST /posts/:id/unaccept-answer
+ * Remove / unmark the best answer from a Q&A post
+ */
+router.post("/:id/unaccept-answer", async (req: Request, res: Response): Promise<void> => {
+  try {
+    const accessToken = getAccessToken(req);
+    if (!accessToken) {
+      res.status(401).json({ error: "Unauthorized" });
+      return;
+    }
+
+    const postId = req.params.id;
+    const { petId } = req.body;
+
+    if (!petId) {
+      res.status(400).json({ error: "petId is required" });
+      return;
+    }
+
+    const supabase = createClient(supabaseUrl!, supabaseServiceKey!);
+
+    // Verify user owns pet
+    const { data: { user } } = await supabase.auth.getUser(accessToken);
+    if (!user) {
+      res.status(401).json({ error: "Invalid session" });
+      return;
+    }
+
+    const { data: pet } = await supabase
+      .from("pets")
+      .select("id")
+      .eq("id", petId)
+      .eq("owner_id", user.id)
+      .single();
+
+    if (!pet) {
+      res.status(403).json({ error: "Forbidden: You do not own this pet profile" });
+      return;
+    }
+
+    const { data: post } = await supabase
+      .from("posts")
+      .select("id, pet_id, accepted_answer_id")
+      .eq("id", postId)
+      .single();
+
+    if (!post || post.pet_id !== petId) {
+      res.status(403).json({ error: "Forbidden: Only the question author can remove the best answer" });
+      return;
+    }
+
+    // Clear accepted_answer_id only — is_solved is managed separately
+    await (supabase.from("posts") as any)
+      .update({
+        accepted_answer_id: null,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", postId);
+
+    // Unmark comments as accepted answer
+    try {
+      await (supabase.from("comments") as any)
+        .update({ is_accepted_answer: false })
+        .eq("post_id", postId);
+    } catch {
+      // Ignored if column optional
+    }
+
+    res.status(200).json({ success: true, message: "Removed best answer" });
+  } catch (err) {
+    console.error("[posts] Unaccept answer error:", err);
+    res.status(500).json({ error: "Failed to remove best answer" });
+  }
+});
+
+/**
+ * POST /posts/:id/mark-solved
+ * Mark a Q&A question as solved (no best answer required)
+ */
+router.post("/:id/mark-solved", async (req: Request, res: Response): Promise<void> => {
+  try {
+    const accessToken = getAccessToken(req);
+    if (!accessToken) {
+      res.status(401).json({ error: "Unauthorized" });
+      return;
+    }
+
+    const postId = req.params.id;
+    const { petId } = req.body;
+
+    if (!petId) {
+      res.status(400).json({ error: "petId is required" });
+      return;
+    }
+
+    const supabase = createClient(supabaseUrl!, supabaseServiceKey!);
+
+    const { data: { user } } = await supabase.auth.getUser(accessToken);
+    if (!user) {
+      res.status(401).json({ error: "Invalid session" });
+      return;
+    }
+
+    const { data: pet } = await supabase
+      .from("pets")
+      .select("id")
+      .eq("id", petId)
+      .eq("owner_id", user.id)
+      .single();
+
+    if (!pet) {
+      res.status(403).json({ error: "Forbidden: You do not own this pet profile" });
+      return;
+    }
+
+    const { data: post } = await supabase
+      .from("posts")
+      .select("id, pet_id, post_type")
+      .eq("id", postId)
+      .single();
+
+    if (!post || post.pet_id !== petId) {
+      res.status(403).json({ error: "Forbidden: Only the question author can mark as solved" });
+      return;
+    }
+
+    if (post.post_type !== "question") {
+      res.status(400).json({ error: "Only question posts can be marked as solved" });
+      return;
+    }
+
+    await (supabase.from("posts") as any)
+      .update({
+        is_solved: true,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", postId);
+
+    res.status(200).json({ success: true, message: "Question marked as solved" });
+  } catch (err) {
+    console.error("[posts] Mark solved error:", err);
+    res.status(500).json({ error: "Failed to mark question as solved" });
+  }
+});
+
+/**
+ * POST /posts/:id/mark-unsolved
+ * Mark a Q&A question as unsolved (does not affect best answer)
+ */
+router.post("/:id/mark-unsolved", async (req: Request, res: Response): Promise<void> => {
+  try {
+    const accessToken = getAccessToken(req);
+    if (!accessToken) {
+      res.status(401).json({ error: "Unauthorized" });
+      return;
+    }
+
+    const postId = req.params.id;
+    const { petId } = req.body;
+
+    if (!petId) {
+      res.status(400).json({ error: "petId is required" });
+      return;
+    }
+
+    const supabase = createClient(supabaseUrl!, supabaseServiceKey!);
+
+    const { data: { user } } = await supabase.auth.getUser(accessToken);
+    if (!user) {
+      res.status(401).json({ error: "Invalid session" });
+      return;
+    }
+
+    const { data: pet } = await supabase
+      .from("pets")
+      .select("id")
+      .eq("id", petId)
+      .eq("owner_id", user.id)
+      .single();
+
+    if (!pet) {
+      res.status(403).json({ error: "Forbidden: You do not own this pet profile" });
+      return;
+    }
+
+    const { data: post } = await supabase
+      .from("posts")
+      .select("id, pet_id, post_type")
+      .eq("id", postId)
+      .single();
+
+    if (!post || post.pet_id !== petId) {
+      res.status(403).json({ error: "Forbidden: Only the question author can mark as unsolved" });
+      return;
+    }
+
+    if (post.post_type !== "question") {
+      res.status(400).json({ error: "Only question posts can be marked as unsolved" });
+      return;
+    }
+
+    await (supabase.from("posts") as any)
+      .update({
+        is_solved: false,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", postId);
+
+    res.status(200).json({ success: true, message: "Question marked as unsolved" });
+  } catch (err) {
+    console.error("[posts] Mark unsolved error:", err);
+    res.status(500).json({ error: "Failed to mark question as unsolved" });
   }
 });
 

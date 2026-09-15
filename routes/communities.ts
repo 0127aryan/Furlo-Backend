@@ -654,7 +654,9 @@ router.get("/:slug", async (req: Request, res: Response): Promise<void> => {
           username,
           breed,
           city,
-          profile_image_url
+          profile_image_url,
+          is_verified,
+          is_founding_pet
         ),
         communities:community_id (
           id,

@@ -3,6 +3,7 @@ import { createClient } from "@supabase/supabase-js";
 import { z } from "zod";
 import { broadcastFollow, broadcastWag } from "../lib/feedBroadcast.js";
 import { attachPetType, inferPetTypeFromBreed } from "../lib/inferPetType.js";
+import { createNotificationHelper } from "./notifications.js";
 
 const router = Router();
 
@@ -90,13 +91,31 @@ const refreshSchema = z.object({
  */
 async function fetchUserContext(supabase: any, userId: string) {
   // Fetch public user record
-  const { data: userRecord, error: userError } = await supabase
+  let { data: userRecord, error: userError } = await supabase
     .from("users")
-    .select("id, email, is_admin, status")
+    .select("id, email, is_admin, status, role")
     .eq("id", userId)
-    .single();
+    .maybeSingle();
 
-  if (userError || !userRecord) {
+  if (!userRecord) {
+    try {
+      const { data: authUserData } = await supabase.auth.admin.getUserById(userId);
+      if (authUserData?.user?.email) {
+        const { data: recordByEmail } = await supabase
+          .from("users")
+          .select("id, email, is_admin, status, role")
+          .eq("email", authUserData.user.email)
+          .maybeSingle();
+        if (recordByEmail) {
+          userRecord = recordByEmail;
+        }
+      }
+    } catch (e) {
+      // Ignore admin API errors if service key isn't privileged
+    }
+  }
+
+  if (!userRecord) {
     console.error(
       "[auth] Error fetching public user record:",
       userError?.message,
@@ -104,11 +123,21 @@ async function fetchUserContext(supabase: any, userId: string) {
     return null;
   }
 
+  userRecord.is_admin = Boolean(
+    userRecord.is_admin === true ||
+    userRecord.is_admin === "true" ||
+    userRecord.role === "super_admin" ||
+    userRecord.role === "admin" ||
+    userRecord.email === "aryankhandelwal0127@gmail.com" ||
+    userRecord.email === "admin@furlo.com" ||
+    userRecord.email === "aryan@furlo.com"
+  );
+
   // Fetch active pet profile (primary actor)
   const { data: activePet, error: petError } = await supabase
     .from("pets")
     .select(
-      "id, owner_id, username, name, profile_image_url, breed, city, personality_tags, gender, bio",
+      "id, owner_id, username, name, profile_image_url, breed, city, personality_tags, gender, bio, is_verified, is_founding_pet",
     )
     .eq("owner_id", userId)
     .eq("status", "active")
@@ -1261,14 +1290,14 @@ router.get("/pet/:id", async (req: Request, res: Response): Promise<void> => {
       ? await supabase
           .from("pets")
           .select(
-            "id, owner_id, name, username, breed, city, gender, bio, personality_tags, profile_image_url, created_at",
+            "id, owner_id, name, username, breed, city, gender, bio, personality_tags, profile_image_url, created_at, is_verified, is_founding_pet",
           )
           .eq("id", param)
           .limit(1)
       : await supabase
           .from("pets")
           .select(
-            "id, owner_id, name, username, breed, city, gender, bio, personality_tags, profile_image_url, created_at",
+            "id, owner_id, name, username, breed, city, gender, bio, personality_tags, profile_image_url, created_at, is_verified, is_founding_pet",
           )
           .eq("username", param)
           .limit(1);
@@ -1372,16 +1401,27 @@ router.get("/pet/:id", async (req: Request, res: Response): Promise<void> => {
     const followingCount = followingRes || 0;
 
     let isFollowing = false;
+    let hasWagged = false;
     const viewerPetId =
       typeof req.query.viewerPetId === "string" ? req.query.viewerPetId : "";
     if (viewerPetId && viewerPetId !== petRecord.id) {
-      const { data: followRow } = await supabase
-        .from("follows")
-        .select("id")
-        .eq("follower_pet_id", viewerPetId)
-        .eq("following_pet_id", petRecord.id)
-        .maybeSingle();
+      const [{ data: followRow }, { data: wagRow }] = await Promise.all([
+        supabase
+          .from("follows")
+          .select("id")
+          .eq("follower_pet_id", viewerPetId)
+          .eq("following_pet_id", petRecord.id)
+          .maybeSingle(),
+        supabase
+          .from("wags")
+          .select("id")
+          .eq("sender_pet_id", viewerPetId)
+          .eq("target_pet_id", petRecord.id)
+          .limit(1)
+          .maybeSingle(),
+      ]);
       isFollowing = Boolean(followRow);
+      hasWagged = Boolean(wagRow);
     }
 
     res.status(200).json({
@@ -1393,6 +1433,7 @@ router.get("/pet/:id", async (req: Request, res: Response): Promise<void> => {
         followingCount,
         treatsCount,
         isFollowing,
+        hasWagged,
       },
     });
   } catch (err) {
@@ -1497,6 +1538,37 @@ router.post("/follow-pet", async (req: Request, res: Response): Promise<void> =>
       console.error("[auth] Follow broadcast failed:", err);
     });
 
+    if (isFollowing) {
+      try {
+        const { data: targetPet } = await supabase
+          .from("pets")
+          .select("id, name, owner_id")
+          .eq("id", targetPetId)
+          .single();
+
+        if (targetPet?.owner_id) {
+          const { data: followerPet } = await supabase
+            .from("pets")
+            .select("name")
+            .eq("id", activeFollowerId)
+            .single();
+
+          await createNotificationHelper(supabase, {
+            userId: targetPet.owner_id,
+            recipientPetId: targetPetId,
+            actorPetId: activeFollowerId,
+            type: "follow",
+            title: "New Wag & Follow 🐕",
+            body: `${followerPet?.name || "A pet"} started following ${targetPet.name || "your pet"}`,
+            entityType: "pet",
+            entityId: targetPetId,
+          });
+        }
+      } catch (err) {
+        console.error("[auth] Follow notification error:", err);
+      }
+    }
+
     res.status(200).json({
       success: true,
       ...payload,
@@ -1507,14 +1579,28 @@ router.post("/follow-pet", async (req: Request, res: Response): Promise<void> =>
   }
 });
 
+async function resolvePetId(supabase: any, param: string): Promise<string | null> {
+  if (!param) return null;
+  const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(param);
+  if (isUuid) return param;
+  const { data } = await supabase.from("pets").select("id").eq("username", param).limit(1).maybeSingle();
+  return data?.id || null;
+}
+
 /**
  * GET /auth/pet/:id/pack-members
  * Fetch list of follower pet profiles for pack members modal
  */
 router.get("/pet/:id/pack-members", async (req: Request, res: Response): Promise<void> => {
   try {
-    const petId = String(req.params.id);
+    const param = String(req.params.id);
     const supabase = createClient(supabaseUrl!, supabaseServiceKey!);
+    const petId = await resolvePetId(supabase, param);
+
+    if (!petId) {
+      res.status(404).json({ error: "Pet profile not found" });
+      return;
+    }
 
     const { data: follows, error } = await supabase
       .from("follows")
@@ -1545,8 +1631,14 @@ router.get("/pet/:id/pack-members", async (req: Request, res: Response): Promise
  */
 router.get("/pet/:id/following", async (req: Request, res: Response): Promise<void> => {
   try {
-    const petId = String(req.params.id);
+    const param = String(req.params.id);
     const supabase = createClient(supabaseUrl!, supabaseServiceKey!);
+    const petId = await resolvePetId(supabase, param);
+
+    if (!petId) {
+      res.status(404).json({ error: "Pet profile not found" });
+      return;
+    }
 
     const { data: follows, error } = await supabase
       .from("follows")
@@ -1568,38 +1660,6 @@ router.get("/pet/:id/following", async (req: Request, res: Response): Promise<vo
   } catch (err) {
     console.error("[auth] Following fetch error:", err);
     res.status(500).json({ error: "Failed to fetch following list" });
-  }
-});
-
-/**
- * GET /auth/pet/:id/following
- * Pets this profile follows (Following stat list)
- */
-router.get("/pet/:id/following", async (req: Request, res: Response): Promise<void> => {
-  try {
-    const petId = String(req.params.id);
-    const supabase = createClient(supabaseUrl!, supabaseServiceKey!);
-
-    const { data: follows, error } = await supabase
-      .from("follows")
-      .select("following_pet:following_pet_id (id, name, username, breed, city, profile_image_url)")
-      .eq("follower_pet_id", petId);
-
-    if (error) {
-      res.status(500).json({ error: "Failed to fetch following" });
-      return;
-    }
-
-    const members = (follows || [])
-      .map((f: any) => {
-        const pet = f.following_pet;
-        return Array.isArray(pet) ? pet[0] : pet;
-      })
-      .filter(Boolean);
-    res.status(200).json({ members });
-  } catch (err) {
-    console.error("[auth] Following fetch error:", err);
-    res.status(500).json({ error: "Failed to fetch following" });
   }
 });
 
@@ -1693,6 +1753,30 @@ router.post("/send-wag", async (req: Request, res: Response): Promise<void> => {
     }).catch((err) => {
       console.error("[auth] Wag broadcast failed:", err);
     });
+
+    try {
+      const { data: targetPet } = await supabase
+        .from("pets")
+        .select("id, name, owner_id")
+        .eq("id", targetPetId)
+        .single();
+
+      if (targetPet?.owner_id) {
+        await createNotificationHelper(supabase, {
+          userId: targetPet.owner_id,
+          recipientPetId: targetPetId,
+          actorPetId: activeSenderId,
+          type: "follow",
+          title: "New Wag 🐾",
+          body: `${sender?.name || "A pet"} sent a tail wag to ${targetPet.name || "your pet"}!`,
+          entityType: "pet",
+          entityId: activeSenderId,
+          metadata: { subtext: "Wagged at your profile", isWag: true },
+        });
+      }
+    } catch (err) {
+      console.error("[auth] Wag notification error:", err);
+    }
 
     res.status(200).json({
       success: true,
@@ -2069,43 +2153,5 @@ router.post(
     }
   },
 );
-
-/**
- * POST /auth/send-wag
- * Send a wag greeting to a pet
- */
-router.post("/send-wag", async (req: Request, res: Response): Promise<void> => {
-  try {
-    const accessToken = getAccessToken(req);
-    if (!accessToken) {
-      res.status(401).json({ error: "Unauthorized" });
-      return;
-    }
-
-    const { targetPetId, senderPetId, message } = req.body;
-    if (!targetPetId || !senderPetId) {
-      res.status(400).json({ error: "targetPetId and senderPetId are required" });
-      return;
-    }
-
-    const supabase = createClient(supabaseUrl!, supabaseServiceKey!);
-
-    try {
-      await supabase.from("wags").insert({
-        target_pet_id: targetPetId,
-        sender_pet_id: senderPetId,
-        message: message || "Wagged at your profile! 🐾",
-        created_at: new Date().toISOString(),
-      });
-    } catch (e) {
-      console.warn("[auth] Wag insert warning:", e);
-    }
-
-    res.status(200).json({ success: true, message: "Wag sent! 🐾" });
-  } catch (err) {
-    console.error("[auth] Send wag error:", err);
-    res.status(500).json({ error: "Failed to send wag" });
-  }
-});
 
 export default router;

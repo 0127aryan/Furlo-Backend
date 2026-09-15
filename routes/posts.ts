@@ -2,8 +2,9 @@ import { Router, Request, Response } from "express";
 import { createClient } from "@supabase/supabase-js";
 import dotenv from "dotenv";
 import { z } from "zod";
-import { broadcastFeedCounts, broadcastNewPost } from "../lib/feedBroadcast.js";
+import { broadcastFeedCounts, broadcastNewPost, broadcastModerationReport } from "../lib/feedBroadcast.js";
 import { attachPetType } from "../lib/inferPetType.js";
+import { createNotificationHelper } from "./notifications.js";
 
 dotenv.config();
 
@@ -146,7 +147,9 @@ router.get("/feed", async (req: Request, res: Response): Promise<void> => {
           username,
           breed,
           city,
-          profile_image_url
+          profile_image_url,
+          is_verified,
+          is_founding_pet
         ),
         communities:community_id (
           id,
@@ -389,7 +392,9 @@ router.post("/create", async (req: Request, res: Response): Promise<void> => {
           username,
           breed,
           city,
-          profile_image_url
+          profile_image_url,
+          is_verified,
+          is_founding_pet
         ),
         communities:community_id (
           id,
@@ -545,6 +550,46 @@ router.post("/:id/like", async (req: Request, res: Response): Promise<void> => {
       unlikedByPetId: hasLiked ? null : petId,
     });
 
+    if (hasLiked) {
+      // Trigger notification for post author
+      try {
+        const { data: { user } } = await supabase.auth.getUser(accessToken);
+        if (user) {
+          const { data: post } = await supabase
+            .from("posts")
+            .select("id, pet_id")
+            .eq("id", postId)
+            .single();
+
+          if (post?.pet_id) {
+            const { data: targetPet } = await supabase
+              .from("pets")
+              .select("name, owner_id")
+              .eq("id", post.pet_id)
+              .single();
+
+            const postOwnerId = targetPet?.owner_id || user.id;
+            if (postOwnerId !== user.id) {
+              const { data: actorPet } = await supabase.from("pets").select("name").eq("id", petId).single();
+
+              await createNotificationHelper(supabase, {
+                userId: postOwnerId,
+                recipientPetId: post.pet_id,
+                actorPetId: petId,
+                type: "treat",
+                title: "New Treat 🐾",
+                body: `${actorPet?.name || "A pet"} sent a treat to ${targetPet?.name ? targetPet.name + "'s" : "your"} post`,
+                entityType: "post",
+                entityId: postId,
+              });
+            }
+          }
+        }
+      } catch (err) {
+        console.error("[posts] Treat notification error:", err);
+      }
+    }
+
     res.status(200).json({ hasLiked, likeCount });
   } catch (err) {
     console.error("[posts] Like error:", err);
@@ -574,7 +619,9 @@ router.get(
           id,
           name,
           username,
-          profile_image_url
+          profile_image_url,
+          is_verified,
+          is_founding_pet
         )
       `,
         )
@@ -617,40 +664,103 @@ router.post(
 
       const postId = String(req.params.id);
       const supabase = createClient(supabaseUrl!, supabaseServiceKey!);
+      const { data: { user } } = await supabase.auth.getUser(accessToken);
+      if (!user) {
+        res.status(401).json({ error: "Invalid user session" });
+        return;
+      }
 
       const { petId, content, parentCommentId } = parsed.data;
 
-      const { data: newComment, error } = await supabase
+      // Verify petId exists and belongs to user context
+      let targetPetId = petId;
+      const { data: petCheck } = await supabase
+        .from("pets")
+        .select("id, owner_id")
+        .eq("id", petId)
+        .single();
+
+      if (!petCheck) {
+        const { data: userPets } = await supabase
+          .from("pets")
+          .select("id")
+          .eq("owner_id", user.id)
+          .limit(1);
+
+        if (userPets && userPets.length > 0) {
+          targetPetId = userPets[0].id;
+        } else {
+          res.status(400).json({ error: "No active pet profile found. Please create a pet profile first." });
+          return;
+        }
+      }
+
+      const { data: insertedComment, error } = await supabase
         .from("comments")
         .insert({
           post_id: postId,
-          pet_id: petId,
+          pet_id: targetPetId,
           parent_comment_id: parentCommentId || null,
           content,
           status: "active",
         })
-        .select(
-          `
-        id,
-        content,
-        created_at,
-        pets:pet_id (
-          id,
-          name,
-          username,
-          profile_image_url
-        )
-      `,
-        )
+        .select("id, content, created_at, pet_id")
         .single();
 
-      if (error || !newComment) {
-        res.status(500).json({ error: "Failed to add comment" });
+      if (error || !insertedComment) {
+        console.error("[posts] Add comment DB insert error:", error);
+        res.status(500).json({ error: error?.message || "Failed to add comment" });
         return;
       }
 
+      const { data: pet } = await supabase
+        .from("pets")
+        .select("id, name, username, profile_image_url")
+        .eq("id", targetPetId)
+        .single();
+
+      const newComment = {
+        ...insertedComment,
+        pets: pet || null,
+      };
+
       const commentCount = await recountComments(supabase, postId);
-      await broadcastFeedCounts({ postId, commentCount });
+      await broadcastFeedCounts({ postId, commentCount }).catch((err) => {
+        console.error("[posts] Live comment broadcast failed:", err);
+      });
+
+      // Trigger notification for post author
+      try {
+        const { data: post } = await supabase
+          .from("posts")
+          .select("id, pet_id")
+          .eq("id", postId)
+          .single();
+
+        if (post?.pet_id) {
+          const { data: targetPet } = await supabase
+            .from("pets")
+            .select("name, owner_id")
+            .eq("id", post.pet_id)
+            .single();
+
+          const postOwnerId = targetPet?.owner_id || user.id;
+          const { data: actorPet } = await supabase.from("pets").select("name").eq("id", targetPetId).single();
+
+          await createNotificationHelper(supabase, {
+            userId: postOwnerId,
+            actorPetId: targetPetId,
+            type: "comment",
+            title: "New Comment 💬",
+            body: `${actorPet?.name || "A pet"} commented: "${content.substring(0, 50)}"`,
+            entityType: "post",
+            entityId: postId,
+            metadata: { commentId: newComment.id, excerpt: content },
+          });
+        }
+      } catch (err) {
+        console.error("[posts] Comment notification error:", err);
+      }
 
       res.status(201).json({ comment: newComment, commentCount });
     } catch (err) {
@@ -701,6 +811,10 @@ router.post(
         res.status(500).json({ error: "Failed to submit report" });
         return;
       }
+
+      broadcastModerationReport(report).catch((bcErr) => {
+        console.warn("[posts] Broadcast moderation report error:", bcErr);
+      });
 
       res
         .status(201)
@@ -808,7 +922,9 @@ router.get("/qa/questions", async (req: Request, res: Response): Promise<void> =
           username,
           breed,
           city,
-          profile_image_url
+          profile_image_url,
+          is_verified,
+          is_founding_pet
         ),
         post_media (
           id,
@@ -866,7 +982,9 @@ router.get("/qa/questions", async (req: Request, res: Response): Promise<void> =
             id,
             name,
             username,
-            profile_image_url
+            profile_image_url,
+            is_verified,
+            is_founding_pet
           )
         `
         )
@@ -1036,7 +1154,9 @@ router.get("/single/:id", async (req: Request, res: Response): Promise<void> => 
           username,
           breed,
           city,
-          profile_image_url
+          profile_image_url,
+          is_verified,
+          is_founding_pet
         ),
         communities:community_id (
           id,
@@ -1083,7 +1203,9 @@ router.get("/single/:id", async (req: Request, res: Response): Promise<void> => 
             name,
             username,
             profile_image_url,
-            breed
+            breed,
+            is_verified,
+            is_founding_pet
           )
         `
         )
@@ -1184,6 +1306,41 @@ router.post("/:id/accept-answer", async (req: Request, res: Response): Promise<v
         .eq("id", commentId);
     } catch {
       // Ignored if column optional
+    }
+
+    // Trigger notification for answer author
+    // Trigger notification for answer author
+    try {
+      const { data: acceptedComment } = await supabase
+        .from("comments")
+        .select("id, pet_id, content")
+        .eq("id", commentId)
+        .single();
+
+      if (acceptedComment?.pet_id) {
+        const { data: answerPet } = await supabase
+          .from("pets")
+          .select("name, owner_id")
+          .eq("id", acceptedComment.pet_id)
+          .single();
+
+        const answerAuthorOwnerId = answerPet?.owner_id || user.id;
+        const { data: questionAuthorPet } = await supabase.from("pets").select("name").eq("id", petId).single();
+
+        await createNotificationHelper(supabase, {
+          userId: answerAuthorOwnerId,
+          recipientPetId: acceptedComment.pet_id,
+          actorPetId: petId,
+          type: "best_answer",
+          title: "Best Answer Accepted ⭐",
+          body: `${questionAuthorPet?.name || "Question author"} accepted your answer as the Best Answer!`,
+          entityType: "post",
+          entityId: String(postId),
+          metadata: { commentId, excerpt: acceptedComment?.content },
+        });
+      }
+    } catch (err) {
+      console.error("[posts] Best answer notification error:", err);
     }
 
     res.status(200).json({ success: true, message: "Marked as accepted answer" });

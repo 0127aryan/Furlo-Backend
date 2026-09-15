@@ -12,6 +12,16 @@ async function checkMigrationNeeded(
   client: pg.Client,
   sqlContent: string
 ): Promise<{ needed: boolean; reason?: string }> {
+  // Constraint / policy / publication changes must always run (column checks alone miss these).
+  if (
+    /DROP\s+CONSTRAINT/i.test(sqlContent) ||
+    /ALTER\s+COLUMN\s+\w+\s+DROP\s+NOT\s+NULL/i.test(sqlContent) ||
+    /CREATE\s+POLICY/i.test(sqlContent) ||
+    /ALTER\s+PUBLICATION/i.test(sqlContent)
+  ) {
+    return { needed: true, reason: "Contains constraint, policy, or publication changes" };
+  }
+
   const createTableRegex = /CREATE\ TABLE\s+(?:IF\ NOT\ EXISTS\s+)?(?:public\.)?([a-zA-Z0-9_]+)/gi;
   const alterAddColumnRegex = /ALTER\ TABLE\s+(?:IF\ EXISTS\s+)?(?:public\.)?([a-zA-Z0-9_]+)\s+ADD\ COLUMN\s+(?:IF\ NOT\ EXISTS\s+)?([a-zA-Z0-9_]+)/gi;
 

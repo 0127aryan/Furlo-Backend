@@ -19,6 +19,9 @@ lerna-debug.log*
 .env.test
 .env.production
 
+# Firebase service account (never commit)
+secrets/
+
 # temp directory
 .temp
 .tmp

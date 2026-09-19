@@ -231,6 +231,26 @@ export async function broadcastPetBadgeUpdate(payload: { petId: string; is_verif
   }
 }
 
+export type PackStatusPayload = {
+  communityId: string
+  slug?: string
+  status: string
+  is_approved: boolean
+  is_verified: boolean
+  is_active: boolean
+  deleted?: boolean
+}
+
+export async function broadcastPackStatusUpdate(payload: PackStatusPayload): Promise<void> {
+  try {
+    const channel = await getNamedChannel('pack-status')
+    await sendBroadcast(channel, 'pack_status_updated', payload)
+  } catch (err) {
+    console.error('[feedBroadcast] pack status update send failed:', err)
+    socialChannels.delete('pack-status')
+  }
+}
+
 export async function broadcastModerationReport(report: unknown): Promise<void> {
   try {
     const channel = await getNamedChannel('moderation-queue')

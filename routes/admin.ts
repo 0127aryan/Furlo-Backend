@@ -9,6 +9,7 @@ import {
   broadcastGlobalMessage,
   broadcastGlobalRevoke,
   broadcastPetBadgeUpdate,
+  broadcastPackStatusUpdate,
   broadcastModerationAction,
   broadcastPostRemoved,
 } from "../lib/feedBroadcast.js";
@@ -417,7 +418,12 @@ router.post("/communities/:id/approve", async (req: Request, res: Response): Pro
 
     const { data: comm, error } = await supabase
       .from("communities")
-      .update({ status: "approved", rejection_reason: null })
+      .update({
+        status: "approved",
+        is_approved: true,
+        is_verified: true,
+        rejection_reason: null,
+      })
       .eq("id", communityId)
       .select()
       .single();
@@ -448,6 +454,7 @@ router.post("/communities/:id/approve", async (req: Request, res: Response): Pro
       }
     }
 
+    await emitPackStatus(comm);
     res.status(200).json({ success: true, community: comm });
   } catch (err) {
     console.error("[admin] Approve community error:", err);
@@ -473,7 +480,12 @@ router.post("/communities/:id/reject", async (req: Request, res: Response): Prom
 
     const { data: comm, error } = await supabase
       .from("communities")
-      .update({ status: "rejected", rejection_reason: reason || "Did not meet pack creation guidelines." })
+      .update({
+        status: "rejected",
+        is_approved: false,
+        is_verified: false,
+        rejection_reason: reason || "Did not meet pack creation guidelines.",
+      })
       .eq("id", communityId)
       .select()
       .single();
@@ -483,9 +495,160 @@ router.post("/communities/:id/reject", async (req: Request, res: Response): Prom
       return;
     }
 
+    await emitPackStatus(comm);
     res.status(200).json({ success: true, community: comm });
   } catch (err) {
     console.error("[admin] Reject community error:", err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+async function emitPackStatus(
+  comm: { id?: string; slug?: string; status?: string; is_approved?: boolean; is_verified?: boolean; is_active?: boolean },
+  extra?: { deleted?: boolean }
+) {
+  if (!comm?.id) return;
+  const status = String(comm.status || (comm.is_approved ? "approved" : "pending"));
+  const approved = comm.is_approved === true || status === "approved" || comm.is_verified === true;
+  try {
+    await broadcastPackStatusUpdate({
+      communityId: String(comm.id),
+      slug: comm.slug ? String(comm.slug) : undefined,
+      status,
+      is_approved: extra?.deleted ? false : approved,
+      is_verified: extra?.deleted ? false : approved,
+      is_active: extra?.deleted ? false : comm.is_active !== false,
+      deleted: Boolean(extra?.deleted),
+    });
+  } catch (err) {
+    console.warn("[admin] pack status broadcast failed:", err);
+  }
+}
+
+async function notifyPackCreator(
+  supabase: any,
+  comm: { id?: string; name?: string; created_by?: string; created_by_pet_id?: string },
+  title: string,
+  body: string
+) {
+  const petId = comm.created_by_pet_id || comm.created_by;
+  if (!petId || !comm.id) return;
+  const { data: creatorPet } = await supabase.from("pets").select("owner_id").eq("id", petId).maybeSingle();
+  if (!creatorPet?.owner_id) return;
+  await createNotificationHelper(supabase, {
+    userId: creatorPet.owner_id,
+    actorPetId: petId,
+    type: "pack_announcement",
+    title,
+    body,
+    entityType: "community",
+    entityId: comm.id,
+  });
+}
+
+/**
+ * POST /admin/communities/:id/suspend
+ * Hide (suspend) or restore a pack, regardless of approval status
+ */
+router.post("/communities/:id/suspend", async (req: Request, res: Response): Promise<void> => {
+  try {
+    const supabase = createClient(supabaseUrl!, supabaseServiceKey!);
+    const auth = await verifyAdminUser(req, res, supabase);
+    if (!auth.authorized) {
+      res.status(auth.status || 401).json({ error: auth.error });
+      return;
+    }
+
+    const communityId = String(req.params.id);
+    const suspended = req.body?.suspended !== false;
+
+    const { data: comm, error } = await supabase
+      .from("communities")
+      .update({ is_active: !suspended })
+      .eq("id", communityId)
+      .select()
+      .single();
+
+    if (error || !comm) {
+      res.status(500).json({ error: suspended ? "Failed to suspend community" : "Failed to restore community" });
+      return;
+    }
+
+    try {
+      if (suspended) {
+        await notifyPackCreator(
+          supabase,
+          comm,
+          "Pack suspended",
+          `Your pack "${comm.name}" has been suspended by Super Admin and is hidden from Furlo.`
+        );
+      } else {
+        await notifyPackCreator(
+          supabase,
+          comm,
+          "Pack restored",
+          `Your pack "${comm.name}" is visible on Furlo again.`
+        );
+      }
+    } catch (notifyErr) {
+      console.warn("[admin] Community suspend notify error:", notifyErr);
+    }
+
+    await emitPackStatus(comm);
+    res.status(200).json({ success: true, community: comm });
+  } catch (err) {
+    console.error("[admin] Suspend community error:", err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+/**
+ * DELETE /admin/communities/:id
+ * Permanently delete a pack, regardless of approval status
+ */
+router.delete("/communities/:id", async (req: Request, res: Response): Promise<void> => {
+  try {
+    const supabase = createClient(supabaseUrl!, supabaseServiceKey!);
+    const auth = await verifyAdminUser(req, res, supabase);
+    if (!auth.authorized) {
+      res.status(auth.status || 401).json({ error: auth.error });
+      return;
+    }
+
+    const communityId = String(req.params.id);
+    const { data: existing } = await supabase
+      .from("communities")
+      .select("id, name, created_by, created_by_pet_id")
+      .eq("id", communityId)
+      .maybeSingle();
+
+    if (!existing) {
+      res.status(404).json({ error: "Community not found" });
+      return;
+    }
+
+    try {
+      await notifyPackCreator(
+        supabase,
+        existing,
+        "Pack deleted",
+        `Your pack "${existing.name}" was removed by Super Admin.`
+      );
+    } catch (notifyErr) {
+      console.warn("[admin] Community delete notify error:", notifyErr);
+    }
+
+    const { error } = await supabase.from("communities").delete().eq("id", communityId);
+    if (error) {
+      console.error("[admin] DELETE community error:", error);
+      res.status(500).json({ error: "Failed to delete community" });
+      return;
+    }
+
+    await emitPackStatus(existing, { deleted: true });
+    res.status(200).json({ success: true, communityId });
+  } catch (err) {
+    console.error("[admin] Delete community error:", err);
     res.status(500).json({ error: "Server error" });
   }
 });
@@ -588,6 +751,73 @@ router.post("/pets/:id/badges", async (req: Request, res: Response): Promise<voi
 });
 
 /**
+ * POST /admin/pets/:id/status
+ * Update a pet profile status (active | suspended | deleted)
+ */
+router.post("/pets/:id/status", async (req: Request, res: Response): Promise<void> => {
+  try {
+    const supabase = createClient(supabaseUrl!, supabaseServiceKey!);
+    const auth = await verifyAdminUser(req, res, supabase);
+    if (!auth.authorized) {
+      res.status(auth.status || 401).json({ error: auth.error });
+      return;
+    }
+
+    const petId = String(req.params.id);
+    const { status } = req.body;
+    if (!status || !["active", "suspended", "deleted"].includes(status)) {
+      res.status(400).json({ error: "Status must be active, suspended, or deleted" });
+      return;
+    }
+
+    const { data: updatedPet, error } = await supabase
+      .from("pets")
+      .update({ status })
+      .eq("id", petId)
+      .select("id, name, username, status, is_verified, is_founding_pet, owner_id")
+      .single();
+
+    if (error || !updatedPet) {
+      res.status(500).json({ error: "Failed to update pet status" });
+      return;
+    }
+
+    try {
+      if (updatedPet.owner_id) {
+        const title =
+          status === "deleted"
+            ? "Pet profile deleted"
+            : status === "suspended"
+              ? "Pet profile suspended"
+              : "Pet profile restored";
+        const body =
+          status === "deleted"
+            ? `The profile "${updatedPet.name}" has been deleted by Super Admin.`
+            : status === "suspended"
+              ? `The profile "${updatedPet.name}" has been suspended by Super Admin and is hidden from Furlo.`
+              : `The profile "${updatedPet.name}" is visible on Furlo again.`;
+        await createNotificationHelper(supabase, {
+          userId: updatedPet.owner_id,
+          actorPetId: updatedPet.id,
+          type: "system",
+          title,
+          body,
+          entityType: "pet",
+          entityId: updatedPet.id,
+        });
+      }
+    } catch (notifyErr) {
+      console.warn("[admin] Pet status notify error:", notifyErr);
+    }
+
+    res.status(200).json({ success: true, pet: updatedPet });
+  } catch (err) {
+    console.error("[admin] Update pet status error:", err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+/**
  * GET /admin/users
  * Searchable & Filterable Pet Lovers (Human Accounts) Directory
  */
@@ -618,6 +848,8 @@ router.get("/users", async (req: Request, res: Response): Promise<void> => {
       query = query.eq("status", "suspended");
     } else if (filter === "admin") {
       query = query.or("is_admin.eq.true,role.eq.super_admin,role.eq.admin");
+    } else if (filter === "deleted") {
+      query = query.eq("status", "deleted");
     }
 
     const { data: users, count, error } = await query;
@@ -650,9 +882,15 @@ router.post("/users/:id/status", async (req: Request, res: Response): Promise<vo
 
     const userId = String(req.params.id);
     const { status, isAdmin } = req.body;
+    const actorId = auth.userRow?.id || auth.user?.id;
+
+    if (status === "deleted" && actorId && userId === actorId) {
+      res.status(400).json({ error: "You cannot delete your own admin account." });
+      return;
+    }
 
     const updates: Record<string, any> = {};
-    if (status && ["active", "suspended"].includes(status)) {
+    if (status && ["active", "suspended", "deleted"].includes(status)) {
       updates.status = status;
     }
     if (typeof isAdmin === "boolean") {
@@ -669,6 +907,14 @@ router.post("/users/:id/status", async (req: Request, res: Response): Promise<vo
     if (error || !updatedUser) {
       res.status(500).json({ error: "Failed to update user status" });
       return;
+    }
+
+    if (status === "suspended" || status === "deleted" || status === "active") {
+      const petStatus = status === "active" ? "active" : status;
+      const { error: petErr } = await supabase.from("pets").update({ status: petStatus }).eq("owner_id", userId);
+      if (petErr) {
+        console.warn("[admin] Failed to sync pet status with user:", petErr);
+      }
     }
 
     res.status(200).json({ success: true, user: updatedUser });
@@ -984,6 +1230,17 @@ router.post("/reports/:id/action", async (req: Request, res: Response): Promise<
   }
 });
 
+async function emitActiveBanner(supabase: any): Promise<void> {
+  const { data: banner } = await supabase
+    .from("banners")
+    .select("*")
+    .eq("is_active", true)
+    .order("created_at", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  await broadcastBannerUpdate(banner || null);
+}
+
 /**
  * GET /admin/banners/active (Public)
  * Fetch the currently active top announcement banner
@@ -1039,6 +1296,11 @@ router.post("/banners", async (req: Request, res: Response): Promise<void> => {
     }
 
     const { text, linkUrl, ctaText, styleType, isActive } = req.body;
+    const activate = isActive !== false;
+
+    if (activate) {
+      await supabase.from("banners").update({ is_active: false }).eq("is_active", true);
+    }
 
     const { data: banner, error } = await supabase
       .from("banners")
@@ -1047,7 +1309,7 @@ router.post("/banners", async (req: Request, res: Response): Promise<void> => {
         link_url: linkUrl || null,
         cta_text: ctaText || "View Details",
         style_type: styleType || "orange",
-        is_active: isActive ?? true,
+        is_active: activate,
       })
       .select()
       .single();
@@ -1057,10 +1319,7 @@ router.post("/banners", async (req: Request, res: Response): Promise<void> => {
       return;
     }
 
-    // Broadcast Realtime Banner Update
-    if (banner && banner.is_active) {
-      broadcastBannerUpdate(banner).catch(() => {});
-    }
+    await emitActiveBanner(supabase);
 
     res.status(201).json({ success: true, banner });
   } catch (err) {
@@ -1085,6 +1344,10 @@ router.post("/banners/:id/toggle", async (req: Request, res: Response): Promise<
     const bannerId = String(req.params.id);
     const { isActive } = req.body;
 
+    if (isActive) {
+      await supabase.from("banners").update({ is_active: false }).eq("is_active", true).neq("id", bannerId);
+    }
+
     const { data: banner, error } = await supabase
       .from("banners")
       .update({ is_active: isActive })
@@ -1097,8 +1360,7 @@ router.post("/banners/:id/toggle", async (req: Request, res: Response): Promise<
       return;
     }
 
-    // Broadcast Realtime Banner Update
-    broadcastBannerUpdate(isActive ? banner : null).catch(() => {});
+    await emitActiveBanner(supabase);
 
     res.status(200).json({ success: true, banner });
   } catch (err) {
@@ -1132,8 +1394,7 @@ router.delete("/banners/:id", async (req: Request, res: Response): Promise<void>
       return;
     }
 
-    // Broadcast null to clear banner in realtime
-    broadcastBannerUpdate(null).catch(() => {});
+    await emitActiveBanner(supabase);
 
     res.status(200).json({ success: true, message: "Banner deleted successfully" });
   } catch (err) {

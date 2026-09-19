@@ -150,6 +150,25 @@ async function fetchUserContext(supabase: any, userId: string) {
   };
 }
 
+function accountBlockMessage(status?: string): string | null {
+  if (!status || status === "active") return null;
+  return status === "deleted" ? "This account has been deleted." : "This account has been suspended.";
+}
+
+/**
+ * Helper to determine current frontend URL for auth email redirects
+ */
+function getFrontendUrl(req: Request): string {
+  if (process.env.FRONTEND_URL && process.env.FRONTEND_URL !== "http://localhost:3000") {
+    return process.env.FRONTEND_URL.replace(/\/$/, "");
+  }
+  const origin = req.headers.origin || (req.headers.referer ? new URL(req.headers.referer as string).origin : undefined);
+  if (origin && typeof origin === "string" && !origin.includes("localhost")) {
+    return origin.replace(/\/$/, "");
+  }
+  return (process.env.FRONTEND_URL || "http://localhost:3000").replace(/\/$/, "");
+}
+
 /**
  * POST /auth/signup
  * Register a user via Supabase Auth
@@ -164,7 +183,7 @@ router.post("/signup", async (req: Request, res: Response): Promise<void> => {
 
     const { email, password } = parsed.data;
     const supabase = createClient(supabaseUrl!, supabaseServiceKey!);
-    const frontendUrl = process.env.FRONTEND_URL;
+    const frontendUrl = getFrontendUrl(req);
 
     const { data, error } = await supabase.auth.signUp({
       email,
@@ -229,7 +248,7 @@ router.post(
     }
 
       const supabase = createClient(supabaseUrl!, supabaseServiceKey!);
-      const frontendUrl = process.env.FRONTEND_URL;
+      const frontendUrl = getFrontendUrl(req);
 
     const { error } = await supabase.auth.resend({
         type: "signup",
@@ -416,6 +435,14 @@ router.post("/login", async (req: Request, res: Response): Promise<void> => {
 
     const { access_token, refresh_token, user } = data.session;
 
+    const context = await fetchUserContext(supabase, user.id);
+    if (context?.user?.status && context.user.status !== "active") {
+      res.status(403).json({
+        error: accountBlockMessage(context.user.status) || "This account has been suspended.",
+      });
+      return;
+    }
+
     // Set secure HttpOnly cookies
     res.cookie(
       "furlo_session",
@@ -427,9 +454,6 @@ router.post("/login", async (req: Request, res: Response): Promise<void> => {
       refresh_token,
       getCookieOptions(COOKIE_REFRESH_MAX_AGE),
     );
-
-    // Retrieve public user row and active pet context
-    const context = await fetchUserContext(supabase, user.id);
 
     if (!context) {
       res
@@ -560,6 +584,13 @@ router.get("/me", async (req: Request, res: Response): Promise<void> => {
       if (!error && user) {
         const context = await fetchUserContext(supabase, user.id);
         if (context) {
+          const blocked = accountBlockMessage(context.user?.status);
+          if (blocked) {
+            res.clearCookie("furlo_session", { path: "/" });
+            res.clearCookie("furlo_refresh", { path: "/" });
+            res.status(403).json({ error: blocked });
+            return;
+          }
           res.status(200).json(context);
           return;
         }
@@ -596,6 +627,13 @@ router.get("/me", async (req: Request, res: Response): Promise<void> => {
 
         const context = await fetchUserContext(supabase, user.id);
         if (context) {
+          const blocked = accountBlockMessage(context.user?.status);
+          if (blocked) {
+            res.clearCookie("furlo_session", { path: "/" });
+            res.clearCookie("furlo_refresh", { path: "/" });
+            res.status(403).json({ error: blocked });
+            return;
+          }
           res.status(200).json(context);
           return;
         }

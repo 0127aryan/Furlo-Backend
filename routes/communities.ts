@@ -16,9 +16,9 @@ const PACK_CATEGORIES = ["local", "breed", "nutrition", "training"] as const;
 type PackCategory = (typeof PACK_CATEGORIES)[number];
 
 const CORE_SELECT =
-  "id, name, slug, description, cover_image_url, member_count, is_active, created_at";
+  "id, name, slug, description, cover_image_url, member_count, is_active, created_at, status, is_approved, is_verified";
 const FULL_SELECT =
-  "id, name, slug, description, cover_image_url, member_count, is_active, created_at, category, city, created_by_pet_id, rules, logo_image_url";
+  "id, name, slug, description, cover_image_url, member_count, is_active, created_at, category, city, created_by_pet_id, rules, logo_image_url, status, is_approved, is_verified";
 
 function db(): SupabaseClient {
   return createClient(supabaseUrl!, supabaseServiceKey!);
@@ -317,7 +317,7 @@ router.get("/mine", async (req: Request, res: Response): Promise<void> => {
     const { data: memberships, error } = await supabase
       .from("community_members")
       .select(
-        "community:community_id (id, name, slug, description, cover_image_url, member_count, category, city, logo_image_url)",
+        "community:community_id (id, name, slug, description, cover_image_url, member_count, category, city, logo_image_url, status, is_approved, is_verified)",
       )
       .eq("pet_id", petId);
 
@@ -325,7 +325,7 @@ router.get("/mine", async (req: Request, res: Response): Promise<void> => {
       const retry = await supabase
         .from("community_members")
         .select(
-          "community:community_id (id, name, slug, description, cover_image_url, member_count)",
+          "community:community_id (id, name, slug, description, cover_image_url, member_count, status, is_approved, is_verified)",
         )
         .eq("pet_id", petId);
       if (retry.error) {
@@ -570,7 +570,7 @@ router.get("/:slug", async (req: Request, res: Response): Promise<void> => {
     }
 
     const communityRow = result.data?.[0];
-    if (result.error || !communityRow) {
+    if (result.error || !communityRow || communityRow.is_active === false) {
       res.status(404).json({ error: "Community not found" });
       return;
     }

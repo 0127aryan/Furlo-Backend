@@ -13,6 +13,7 @@ import {
   broadcastModerationAction,
   broadcastPostRemoved,
 } from "../lib/feedBroadcast.js";
+import { paginationMeta, parsePagination } from "../lib/pagination.js";
 
 dotenv.config();
 
@@ -288,10 +289,19 @@ router.get("/communities/pending", async (req: Request, res: Response): Promise<
       return;
     }
 
-    const { data: rawCommunities, error } = await supabase
+    const status = String(req.query.status || "all").trim().toLowerCase();
+    const { page, limit, offset } = parsePagination(req.query);
+
+    let query = supabase
       .from("communities")
-      .select("*")
+      .select("*", { count: "exact" })
       .order("created_at", { ascending: false });
+
+    if (status === "pending" || status === "approved" || status === "rejected") {
+      query = query.eq("status", status);
+    }
+
+    const { data: rawCommunities, error, count } = await query.range(offset, offset + limit - 1);
 
     if (error) {
       console.error("[admin] GET pending communities error:", error);
@@ -394,7 +404,10 @@ router.get("/communities/pending", async (req: Request, res: Response): Promise<
       };
     });
 
-    res.status(200).json({ communities });
+    res.status(200).json({
+      communities,
+      ...paginationMeta(page, limit, count || 0),
+    });
   } catch (err) {
     console.error("[admin] GET pending communities exception:", err);
     res.status(500).json({ error: "Server error" });
@@ -668,6 +681,7 @@ router.get("/pets", async (req: Request, res: Response): Promise<void> => {
 
     const search = (req.query.search as string) || "";
     const filter = (req.query.filter as string) || "all"; // all | verified | founding
+    const { page, limit, offset } = parsePagination(req.query);
 
     let query = supabase
       .from("pets")
@@ -685,7 +699,7 @@ router.get("/pets", async (req: Request, res: Response): Promise<void> => {
       query = query.eq("is_founding_pet", true);
     }
 
-    const { data: pets, count, error } = await query;
+    const { data: pets, count, error } = await query.range(offset, offset + limit - 1);
 
     if (error) {
       console.error("[admin] GET pets error:", error);
@@ -693,7 +707,10 @@ router.get("/pets", async (req: Request, res: Response): Promise<void> => {
       return;
     }
 
-    res.status(200).json({ pets: pets || [], totalCount: count || 0 });
+    res.status(200).json({
+      pets: pets || [],
+      ...paginationMeta(page, limit, count || 0),
+    });
   } catch (err) {
     console.error("[admin] GET pets exception:", err);
     res.status(500).json({ error: "Server error" });
@@ -832,6 +849,7 @@ router.get("/users", async (req: Request, res: Response): Promise<void> => {
 
     const search = (req.query.search as string) || "";
     const filter = (req.query.filter as string) || "all"; // all | active | suspended | admin
+    const { page, limit, offset } = parsePagination(req.query);
 
     let query = supabase
       .from("users")
@@ -852,7 +870,7 @@ router.get("/users", async (req: Request, res: Response): Promise<void> => {
       query = query.eq("status", "deleted");
     }
 
-    const { data: users, count, error } = await query;
+    const { data: users, count, error } = await query.range(offset, offset + limit - 1);
 
     if (error) {
       console.error("[admin] GET users error:", error);
@@ -860,7 +878,10 @@ router.get("/users", async (req: Request, res: Response): Promise<void> => {
       return;
     }
 
-    res.status(200).json({ users: users || [], totalCount: count || 0 });
+    res.status(200).json({
+      users: users || [],
+      ...paginationMeta(page, limit, count || 0),
+    });
   } catch (err) {
     console.error("[admin] GET users exception:", err);
     res.status(500).json({ error: "Server error" });
@@ -937,10 +958,21 @@ router.get("/reports", async (req: Request, res: Response): Promise<void> => {
       return;
     }
 
-    const { data: rawReports, error } = await supabase
+    const status = String(req.query.status || "all").trim().toLowerCase();
+    const { page, limit, offset } = parsePagination(req.query);
+
+    let query = supabase
       .from("reports")
-      .select("*, reporter_pet:reporter_pet_id(id, name, username, owner_id)")
+      .select("*, reporter_pet:reporter_pet_id(id, name, username, owner_id)", { count: "exact" })
       .order("created_at", { ascending: false });
+
+    if (status === "open") {
+      query = query.in("status", ["pending", "open"]);
+    } else if (status === "resolved") {
+      query = query.eq("status", "resolved");
+    }
+
+    const { data: rawReports, error, count } = await query.range(offset, offset + limit - 1);
 
     if (error) {
       console.error("[admin] GET reports error:", error);
@@ -1149,7 +1181,10 @@ router.get("/reports", async (req: Request, res: Response): Promise<void> => {
       };
     });
 
-    res.status(200).json({ reports });
+    res.status(200).json({
+      reports,
+      ...paginationMeta(page, limit, count || 0),
+    });
   } catch (err) {
     console.error("[admin] GET reports exception:", err);
     res.status(500).json({ error: "Server error" });
@@ -1270,12 +1305,17 @@ router.get("/banners/active", async (req: Request, res: Response): Promise<void>
 router.get("/banners", async (req: Request, res: Response): Promise<void> => {
   try {
     const supabase = createClient(supabaseUrl!, supabaseServiceKey!);
-    const { data: banners } = await supabase
+    const { page, limit, offset } = parsePagination(req.query);
+    const { data: banners, count } = await supabase
       .from("banners")
-      .select("*")
-      .order("created_at", { ascending: false });
+      .select("*", { count: "exact" })
+      .order("created_at", { ascending: false })
+      .range(offset, offset + limit - 1);
 
-    res.status(200).json({ banners: banners || [] });
+    res.status(200).json({
+      banners: banners || [],
+      ...paginationMeta(page, limit, count || 0),
+    });
   } catch (err) {
     console.error("[admin] GET banners error:", err);
     res.status(500).json({ error: "Server error" });
@@ -1416,6 +1456,7 @@ router.get("/broadcast/history", async (req: Request, res: Response): Promise<vo
       return;
     }
 
+    const { page, limit, offset } = parsePagination(req.query);
     const { data: rawHistory, error } = await supabase
       .from("notifications")
       .select("id, title, body, created_at, metadata")
@@ -1447,7 +1488,13 @@ router.get("/broadcast/history", async (req: Request, res: Response): Promise<vo
       }
     });
 
-    res.status(200).json({ history: Array.from(map.values()) });
+    const grouped = Array.from(map.values());
+    const paged = grouped.slice(offset, offset + limit);
+
+    res.status(200).json({
+      history: paged,
+      ...paginationMeta(page, limit, grouped.length),
+    });
   } catch (err) {
     console.error("[admin] Broadcast history error:", err);
     res.status(500).json({ error: "Server error" });

@@ -1362,50 +1362,20 @@ router.get("/pet/:id", async (req: Request, res: Response): Promise<void> => {
       users: ownerUser,
     };
 
-    const { data: posts } = await supabase
-      .from("posts")
-      .select(`
-        id,
-        caption,
-        post_type,
-        location_city,
-        like_count,
-        comment_count,
-        status,
-        created_at,
-        pets:pet_id (
-          id,
-          name,
-          username,
-          breed,
-          city,
-          profile_image_url
-        ),
-        communities:community_id (
-          id,
-          name,
-          slug
-        ),
-        post_media (
-          id,
-          media_url,
-          display_order
-        )
-      `)
-      .eq("pet_id", petRecord.id)
-      .eq("status", "active")
-      .order("created_at", { ascending: false });
+    const [{ count: barksCount }, { data: likeRows }] = await Promise.all([
+      supabase
+        .from("posts")
+        .select("id", { count: "exact", head: true })
+        .eq("pet_id", petRecord.id)
+        .eq("status", "active"),
+      supabase
+        .from("posts")
+        .select("like_count")
+        .eq("pet_id", petRecord.id)
+        .eq("status", "active"),
+    ]);
 
-    const formattedPosts = (posts || []).map((post) => ({
-      ...post,
-      pets: attachPetType(post.pets as { breed?: string; pet_type?: string }),
-      media:
-        post.post_media?.sort((a, b) => a.display_order - b.display_order) ||
-        [],
-    }));
-
-    // Dynamic database counts for stats bar
-    const treatsCount = formattedPosts.reduce(
+    const treatsCount = (likeRows || []).reduce(
       (sum, p) => sum + (p.like_count || 0),
       0,
     );
@@ -1464,9 +1434,9 @@ router.get("/pet/:id", async (req: Request, res: Response): Promise<void> => {
 
     res.status(200).json({
       pet,
-      posts: formattedPosts,
+      posts: [],
       stats: {
-        barksCount: formattedPosts.length,
+        barksCount: barksCount || 0,
         packMembersCount,
         followingCount,
         treatsCount,

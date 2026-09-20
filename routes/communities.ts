@@ -1,7 +1,7 @@
 import { Router, Request, Response } from "express";
 import { createClient, SupabaseClient } from "@supabase/supabase-js";
 import dotenv from "dotenv";
-import { attachPetType } from "../lib/inferPetType.js";
+import { paginationMeta, parsePagination } from "../lib/pagination.js";
 
 dotenv.config();
 
@@ -55,16 +55,6 @@ function parsePet(value: unknown) {
   return Array.isArray(value) ? value[0] || null : value;
 }
 
-function tallyByPostId(
-  rows: { post_id: string }[] | null,
-): Map<string, number> {
-  const counts = new Map<string, number>();
-  for (const row of rows || []) {
-    counts.set(row.post_id, (counts.get(row.post_id) || 0) + 1);
-  }
-  return counts;
-}
-
 async function uploadCover(
   supabase: SupabaseClient,
   coverData: string,
@@ -89,22 +79,67 @@ async function uploadCover(
   return data.publicUrl || coverData;
 }
 
-async function fetchCommunities(
+function ilikeSafe(value: string) {
+  return value.replace(/[%_,()]/g, " ").trim();
+}
+
+function applyCommunityFilters(query: any, q: string, categoryRaw: string) {
+  let next = query.or("status.is.null,status.neq.rejected");
+
+  if (q) {
+    const needle = ilikeSafe(q);
+    if (needle) {
+      next = next.or(
+        `name.ilike.%${needle}%,description.ilike.%${needle}%,city.ilike.%${needle}%`,
+      );
+    }
+  }
+
+  if (categoryRaw && categoryRaw !== "all packs" && categoryRaw !== "all") {
+    if (categoryRaw.includes("breed")) {
+      next = next.or(
+        "category.ilike.%breed%,name.ilike.%retriever%,name.ilike.%indie%,description.ilike.%breed%",
+      );
+    } else if (categoryRaw.includes("local")) {
+      next = next.or(
+        "category.ilike.%local%,name.ilike.%bangalore%,description.ilike.%bangalore%",
+      );
+    } else if (categoryRaw.includes("nutrition")) {
+      next = next.or(
+        "category.ilike.%nutrition%,description.ilike.%feed%,description.ilike.%diet%",
+      );
+    } else if (categoryRaw.includes("train")) {
+      next = next.or("category.ilike.%train%,description.ilike.%puppy%");
+    } else if (categoryRaw.includes("senior")) {
+      next = next.or("category.ilike.%senior%,description.ilike.%senior%");
+    } else {
+      const category = ilikeSafe(categoryRaw);
+      if (category) next = next.ilike("category", `%${category}%`);
+    }
+  }
+
+  return next;
+}
+
+async function fetchCommunitiesPage(
   supabase: SupabaseClient,
   withExtras: boolean,
-): Promise<{ data: any[] | null; error: any }> {
-  if (withExtras) {
-    return supabase
+  q: string,
+  categoryRaw: string,
+  offset: number,
+  limit: number,
+): Promise<{ data: any[] | null; error: any; count: number | null }> {
+  const columns = withExtras ? FULL_SELECT : CORE_SELECT;
+  const query = applyCommunityFilters(
+    supabase
       .from("communities")
-      .select(FULL_SELECT)
+      .select(columns, { count: "exact" })
       .eq("is_active", true)
-      .order("member_count", { ascending: false });
-  }
-  return supabase
-    .from("communities")
-    .select(CORE_SELECT)
-    .eq("is_active", true)
-    .order("member_count", { ascending: false });
+      .order("member_count", { ascending: false }),
+    q,
+    categoryRaw,
+  );
+  return query.range(offset, offset + limit - 1);
 }
 
 function mapCommunity(
@@ -219,12 +254,21 @@ router.get("/", async (req: Request, res: Response): Promise<void> => {
     const q = String(req.query.q || "").trim();
     const categoryRaw = String(req.query.category || "").trim().toLowerCase();
     const petId = String(req.query.petId || "").trim();
+    const { page, limit, offset } = parsePagination(req.query);
 
-    let { data: rows, error } = await fetchCommunities(supabase, true);
+    let { data: rows, error, count } = await fetchCommunitiesPage(
+      supabase,
+      true,
+      q,
+      categoryRaw,
+      offset,
+      limit,
+    );
     if (error) {
-      const retry = await fetchCommunities(supabase, false);
+      const retry = await fetchCommunitiesPage(supabase, false, q, categoryRaw, offset, limit);
       rows = retry.data;
       error = retry.error;
+      count = retry.count;
     }
 
     if (error) {
@@ -232,52 +276,27 @@ router.get("/", async (req: Request, res: Response): Promise<void> => {
       return;
     }
 
-    let list = (rows || []).filter((row) => (row as any).status !== "rejected");
-
-    if (q) {
-      const needle = q.toLowerCase();
-      list = list.filter(
-        (row) =>
-          String(row.name || "").toLowerCase().includes(needle) ||
-          String(row.description || "").toLowerCase().includes(needle) ||
-          String(row.city || "").toLowerCase().includes(needle),
-      );
-    }
-
-    if (categoryRaw && categoryRaw !== "all packs" && categoryRaw !== "all") {
-      list = list.filter((row) => {
-        const cat = String((row as any).category || "").toLowerCase();
-        const name = String((row as any).name || "").toLowerCase();
-        const desc = String((row as any).description || "").toLowerCase();
-
-        if (cat === categoryRaw) return true;
-        if (categoryRaw.includes("breed") && (cat.includes("breed") || name.includes("retriever") || name.includes("indie") || desc.includes("breed"))) return true;
-        if (categoryRaw.includes("local") && (cat.includes("local") || name.includes("bangalore") || desc.includes("bangalore"))) return true;
-        if (categoryRaw.includes("nutrition") && (cat.includes("nutrition") || desc.includes("feed") || desc.includes("diet"))) return true;
-        if (categoryRaw.includes("train") && (cat.includes("train") || desc.includes("puppy"))) return true;
-        if (categoryRaw.includes("senior") && (cat.includes("senior") || desc.includes("senior"))) return true;
-
-        return false;
-      });
-    }
+    const list = rows || [];
+    const pageIds = list.map((row) => String(row.id));
 
     const joinedIds = new Set<string>();
-    if (petId) {
+    if (petId && pageIds.length > 0) {
       const { data: memberships } = await supabase
         .from("community_members")
         .select("community_id")
-        .eq("pet_id", petId);
+        .eq("pet_id", petId)
+        .in("community_id", pageIds);
       for (const row of memberships || []) joinedIds.add(row.community_id);
     }
 
-    // Query exact live member counts from community_members table for all communities
     const memberCountMap: Record<string, number> = {};
-    const { data: countRows } = await supabase
-      .from("community_members")
-      .select("community_id");
+    if (pageIds.length > 0) {
+      const { data: countRows } = await supabase
+        .from("community_members")
+        .select("community_id")
+        .in("community_id", pageIds);
 
-    if (countRows) {
-      for (const row of countRows) {
+      for (const row of countRows || []) {
         const cId = String(row.community_id);
         memberCountMap[cId] = (memberCountMap[cId] || 0) + 1;
       }
@@ -290,12 +309,15 @@ router.get("/", async (req: Request, res: Response): Promise<void> => {
         { ...row, member_count: liveCount } as Record<string, unknown>,
         {
           joined: joinedIds.has(cId),
-          trending: index < 5,
+          trending: page === 1 && index < 5,
         },
       );
     });
 
-    res.status(200).json(formatted);
+    res.status(200).json({
+      communities: formatted,
+      ...paginationMeta(page, limit, count || 0),
+    });
   } catch (err) {
     console.error("[communities] List error:", err);
     res.status(500).json({ error: "Failed to fetch communities" });
@@ -551,26 +573,66 @@ router.post("/:id/join", async (req: Request, res: Response): Promise<void> => {
 /**
  * GET /communities/:slug
  */
+async function resolveCommunity(supabase: SupabaseClient, param: string) {
+  const isUuid =
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(param);
+
+  let result: any = isUuid
+    ? await supabase.from("communities").select(FULL_SELECT).eq("id", param).limit(1)
+    : await supabase.from("communities").select(FULL_SELECT).eq("slug", param).limit(1);
+
+  if (result.error) {
+    result = isUuid
+      ? await supabase.from("communities").select(CORE_SELECT).eq("id", param).limit(1)
+      : await supabase.from("communities").select(CORE_SELECT).eq("slug", param).limit(1);
+  }
+
+  const communityRow = result.data?.[0];
+  if (result.error || !communityRow || communityRow.is_active === false) {
+    return null;
+  }
+  return communityRow;
+}
+
+router.get("/:slug/members", async (req: Request, res: Response): Promise<void> => {
+  try {
+    const supabase = db();
+    const communityRow = await resolveCommunity(supabase, String(req.params.slug));
+    if (!communityRow) {
+      res.status(404).json({ error: "Community not found" });
+      return;
+    }
+
+    const { page, limit, offset } = parsePagination(req.query);
+    const { data: memberRows, count, error } = await supabase
+      .from("community_members")
+      .select("pet:pet_id (id, name, username, breed, city, profile_image_url)", { count: "exact" })
+      .eq("community_id", communityRow.id)
+      .range(offset, offset + limit - 1);
+
+    if (error) {
+      res.status(500).json({ error: error.message });
+      return;
+    }
+
+    const members = (memberRows || []).map((row) => parsePet(row.pet)).filter(Boolean);
+    res.status(200).json({
+      members,
+      ...paginationMeta(page, limit, count || 0),
+    });
+  } catch (err) {
+    console.error("[communities] Members error:", err);
+    res.status(500).json({ error: "Failed to fetch community members" });
+  }
+});
+
 router.get("/:slug", async (req: Request, res: Response): Promise<void> => {
   try {
     const supabase = db();
     const param = String(req.params.slug);
     const petId = String(req.query.petId || "").trim();
-    const isUuid =
-      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(param);
-
-    let result: any = isUuid
-      ? await supabase.from("communities").select(FULL_SELECT).eq("id", param).limit(1)
-      : await supabase.from("communities").select(FULL_SELECT).eq("slug", param).limit(1);
-
-    if (result.error) {
-      result = isUuid
-        ? await supabase.from("communities").select(CORE_SELECT).eq("id", param).limit(1)
-        : await supabase.from("communities").select(CORE_SELECT).eq("slug", param).limit(1);
-    }
-
-    const communityRow = result.data?.[0];
-    if (result.error || !communityRow || communityRow.is_active === false) {
+    const communityRow = await resolveCommunity(supabase, param);
+    if (!communityRow) {
       res.status(404).json({ error: "Community not found" });
       return;
     }
@@ -590,7 +652,7 @@ router.get("/:slug", async (req: Request, res: Response): Promise<void> => {
       .from("community_members")
       .select("pet:pet_id (id, name, username, breed, city, profile_image_url)", { count: "exact" })
       .eq("community_id", communityRow.id)
-      .limit(80);
+      .limit(10);
 
     const members = (memberRows || []).map((row) => parsePet(row.pet)).filter(Boolean);
     const liveCount = totalMemberCount ?? members.length;
@@ -635,84 +697,6 @@ router.get("/:slug", async (req: Request, res: Response): Promise<void> => {
     }
     if (admins.length === 0) admins = members.slice(0, 1);
 
-    // Query community posts
-    const { data: communityPosts } = await supabase
-      .from("posts")
-      .select(
-        `
-        id,
-        caption,
-        post_type,
-        location_city,
-        like_count,
-        comment_count,
-        status,
-        created_at,
-        pets:pet_id (
-          id,
-          name,
-          username,
-          breed,
-          city,
-          profile_image_url,
-          is_verified,
-          is_founding_pet
-        ),
-        communities:community_id (
-          id,
-          name,
-          slug
-        ),
-        post_media (
-          id,
-          media_url,
-          display_order
-        )
-      `,
-      )
-      .eq("community_id", communityRow.id)
-      .eq("status", "active")
-      .order("created_at", { ascending: false })
-      .limit(50);
-
-    const postIds = (communityPosts || []).map((post) => post.id);
-    const [likeRows, commentRows, myLikes] = await Promise.all([
-      postIds.length
-        ? supabase.from("likes").select("post_id").in("post_id", postIds)
-        : Promise.resolve({ data: [] as { post_id: string }[], error: null }),
-      postIds.length
-        ? supabase
-            .from("comments")
-            .select("post_id")
-            .eq("status", "active")
-            .in("post_id", postIds)
-        : Promise.resolve({ data: [] as { post_id: string }[], error: null }),
-      petId
-        ? supabase.from("likes").select("post_id").eq("pet_id", petId)
-        : Promise.resolve({ data: [] as { post_id: string }[], error: null }),
-    ]);
-
-    const likeCounts = (likeRows as any).error ? null : tallyByPostId((likeRows as any).data);
-    const commentCounts = (commentRows as any).error
-      ? null
-      : tallyByPostId((commentRows as any).data);
-    const likedPostIds = new Set(
-      ((myLikes as any).data || []).map((row: { post_id: string }) => row.post_id),
-    );
-
-    const formattedPosts = (communityPosts || []).map((post) => ({
-      ...post,
-      pets: attachPetType(post.pets as { breed?: string; pet_type?: string }),
-      like_count: likeCounts ? likeCounts.get(post.id) || 0 : post.like_count,
-      comment_count: commentCounts
-        ? commentCounts.get(post.id) || 0
-        : post.comment_count,
-      hasLiked: likedPostIds.has(post.id),
-      media:
-        post.post_media?.sort((a: any, b: any) => a.display_order - b.display_order) ||
-        [],
-    }));
-
     const mapped = mapCommunity(
       { ...communityRow, member_count: liveCount } as Record<string, unknown>,
       { joined },
@@ -722,10 +706,11 @@ router.get("/:slug", async (req: Request, res: Response): Promise<void> => {
       community: mapped,
       joined,
       members,
+      memberCount: liveCount,
       admins,
       announcement,
       rules: mapped.rules,
-      posts: formattedPosts,
+      posts: [],
     });
   } catch (err) {
     console.error("[communities] Detail error:", err);

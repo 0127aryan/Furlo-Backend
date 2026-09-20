@@ -4,6 +4,7 @@ import dotenv from "dotenv";
 import { z } from "zod";
 import { broadcastFeedCounts, broadcastNewPost, broadcastModerationReport } from "../lib/feedBroadcast.js";
 import { attachPetType } from "../lib/inferPetType.js";
+import { paginationMeta, parsePagination } from "../lib/pagination.js";
 import { createNotificationHelper } from "./notifications.js";
 
 dotenv.config();
@@ -77,16 +78,27 @@ async function recountComments(
   return commentCount;
 }
 
-const createPostSchema = z.object({
-  petId: z.string().uuid(),
-  communityId: z.string().uuid().optional().nullable(),
-  caption: z.string().max(500).optional(),
-  postType: z
-    .enum(["regular", "question", "advice", "meme"])
-    .default("regular"),
-  topicCategory: z.string().optional().nullable(),
-  mediaData: z.array(z.string()).optional(), // base64 strings or URLs
-});
+const createPostSchema = z
+  .object({
+    petId: z.string().uuid(),
+    communityId: z.string().uuid().optional().nullable(),
+    caption: z.string().max(500).optional(),
+    postType: z
+      .enum(["regular", "question", "advice", "meme"])
+      .default("regular"),
+    topicCategory: z.string().optional().nullable(),
+    mediaData: z.array(z.string()).optional(), // base64 strings or URLs
+  })
+  .refine(
+    (data) => {
+      const hasCaption = Boolean(data.caption?.trim());
+      const hasMedia = Boolean(
+        data.mediaData?.some((item) => typeof item === "string" && item.trim().length > 0)
+      );
+      return hasCaption || hasMedia;
+    },
+    { message: "Add a caption or a photo to post." }
+  );
 
 const createCommentSchema = z.object({
   petId: z.string().uuid(),
@@ -125,6 +137,8 @@ router.get("/feed", async (req: Request, res: Response): Promise<void> => {
 
     const activePetId = req.query.petId as string;
     const communityId = String(req.query.communityId || "").trim();
+    const authorPetId = String(req.query.authorPetId || "").trim();
+    const { page, limit, offset } = parsePagination(req.query);
 
     let feedQuery = supabase
       .from("posts")
@@ -162,6 +176,7 @@ router.get("/feed", async (req: Request, res: Response): Promise<void> => {
           display_order
         )
       `,
+        { count: "exact" },
       )
       .eq("status", "active");
 
@@ -169,9 +184,13 @@ router.get("/feed", async (req: Request, res: Response): Promise<void> => {
       feedQuery = feedQuery.eq("community_id", communityId);
     }
 
-    const { data: posts, error } = await feedQuery
+    if (authorPetId) {
+      feedQuery = feedQuery.eq("pet_id", authorPetId);
+    }
+
+    const { data: posts, error, count } = await feedQuery
       .order("created_at", { ascending: false })
-      .limit(30);
+      .range(offset, offset + limit - 1);
 
     if (error) {
       console.error("[posts] Feed query error:", error.message);
@@ -217,7 +236,10 @@ router.get("/feed", async (req: Request, res: Response): Promise<void> => {
         [],
     }));
 
-    res.status(200).json({ posts: formattedPosts });
+    res.status(200).json({
+      posts: formattedPosts,
+      ...paginationMeta(page, limit, count || 0),
+    });
   } catch (err) {
     console.error("[posts] Feed error:", err);
     res.status(500).json({ error: "Failed to fetch feed" });
@@ -900,6 +922,7 @@ router.get("/qa/questions", async (req: Request, res: Response): Promise<void> =
     const filter = String(req.query.filter || "all").trim().toLowerCase();
     const search = String(req.query.search || "").trim();
     const petId = req.query.petId as string | undefined;
+    const { page, limit, offset } = parsePagination(req.query);
 
     let query = supabase
       .from("posts")
@@ -931,7 +954,8 @@ router.get("/qa/questions", async (req: Request, res: Response): Promise<void> =
           media_url,
           display_order
         )
-      `
+      `,
+        { count: "exact" },
       )
       .eq("status", "active")
       .eq("post_type", "question");
@@ -954,9 +978,9 @@ router.get("/qa/questions", async (req: Request, res: Response): Promise<void> =
       query = query.or(`caption.ilike.%${search}%,topic_category.ilike.%${search}%`);
     }
 
-    const { data: questions, error } = await query
+    const { data: questions, error, count } = await query
       .order("created_at", { ascending: false })
-      .limit(30);
+      .range(offset, offset + limit - 1);
 
     if (error) {
       console.error("[posts] Q&A query error:", error.message);
@@ -1013,7 +1037,10 @@ router.get("/qa/questions", async (req: Request, res: Response): Promise<void> =
       media: q.post_media?.sort((a, b) => a.display_order - b.display_order) || [],
     }));
 
-    res.status(200).json({ questions: formattedQuestions });
+    res.status(200).json({
+      questions: formattedQuestions,
+      ...paginationMeta(page, limit, count || 0),
+    });
   } catch (err) {
     console.error("[posts] Q&A Hub error:", err);
     res.status(500).json({ error: "Failed to fetch Q&A questions" });

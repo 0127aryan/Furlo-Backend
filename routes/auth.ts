@@ -361,7 +361,9 @@ function getOAuthRedirectTo(req: Request, platform: "web" | "mobile"): string {
 }
 
 async function findAuthUserByEmail(
-  supabase: ReturnType<typeof createClient>,
+  supabase: {
+    auth: { admin: { listUsers: (...args: any[]) => Promise<any> } };
+  },
   email: string,
 ) {
   const normalized = email.toLowerCase();

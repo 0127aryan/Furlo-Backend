@@ -376,7 +376,7 @@ async function findAuthUserByEmail(
       throw error;
     }
     const match = data.users.find(
-      (u) => u.email?.toLowerCase() === normalized,
+      (u: { email?: string | null }) => u.email?.toLowerCase() === normalized,
     );
     if (match) return match;
     if (data.users.length < 200) break;

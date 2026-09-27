@@ -5,6 +5,7 @@ import { z } from "zod";
 import { broadcastFollow, broadcastWag } from "../lib/feedBroadcast.js";
 import { attachPetType, inferPetTypeFromBreed } from "../lib/inferPetType.js";
 import { createNotificationHelper } from "./notifications.js";
+import { resetAuthRateLimitAfterSuccess } from "../lib/authRateLimitReset.js";
 
 const router = Router();
 
@@ -744,6 +745,8 @@ router.post("/login", async (req: Request, res: Response): Promise<void> => {
       return;
     }
 
+    resetAuthRateLimitAfterSuccess(email);
+
     res.status(200).json({
       user: context.user,
       activePet: context.activePet,
@@ -954,6 +957,8 @@ router.post(
         return;
       }
 
+      resetAuthRateLimitAfterSuccess(email);
+
       res.status(200).json({
         user: context.user,
         activePet: context.activePet,
@@ -1161,6 +1166,8 @@ router.post(
         res.status(500).json({ error: "Failed to retrieve user context profile." });
         return;
       }
+
+      resetAuthRateLimitAfterSuccess(context.user?.email ?? user.email);
 
       res.status(200).json({
         user: context.user,

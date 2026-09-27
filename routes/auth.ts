@@ -1,3 +1,4 @@
+import { randomUUID } from "crypto";
 import { Router, Request, Response } from "express";
 import { createClient } from "@supabase/supabase-js";
 import { z } from "zod";
@@ -34,25 +35,49 @@ const getCookie = (req: Request, name: string): string | undefined => {
   if (!cookieHeader) return undefined;
   const cookies = cookieHeader.split(";");
   for (const cookie of cookies) {
-    const [key, val] = cookie.trim().split("=");
+    const trimmed = cookie.trim();
+    const eq = trimmed.indexOf("=");
+    if (eq === -1) continue;
+    const key = trimmed.slice(0, eq);
+    const val = trimmed.slice(eq + 1);
     if (key === name) {
-      return decodeURIComponent(val);
+      try {
+        return decodeURIComponent(val);
+      } catch {
+        return val;
+      }
     }
   }
   return undefined;
 };
 
+function listAccessTokens(req: Request): string[] {
+  const tokens: string[] = [];
+  const authHeader = req.headers.authorization;
+  const bearer =
+    authHeader && authHeader.startsWith("Bearer ")
+      ? authHeader.substring(7).trim()
+      : "";
+  const cookie = getCookie(req, "furlo_session")?.trim() || "";
+  // Bearer is the newest token from login/OTP JSON — try it before leftover cookies.
+  if (bearer) tokens.push(bearer);
+  if (cookie && cookie !== bearer) tokens.push(cookie);
+  return tokens;
+}
+
 // Helper to extract session token from cookie or Authorization Bearer header
 const getAccessToken = (req: Request): string | null => {
-  const sessionCookie = getCookie(req, "furlo_session");
-  if (sessionCookie) return sessionCookie;
-
-  const authHeader = req.headers.authorization;
-  if (authHeader && authHeader.startsWith("Bearer ")) {
-    return authHeader.substring(7);
-  }
-  return null;
+  return listAccessTokens(req)[0] ?? null;
 };
+
+function clearSessionCookies(res: Response): void {
+  res.clearCookie("furlo_session", { path: "/" });
+  res.clearCookie("furlo_refresh", { path: "/" });
+}
+
+function clearOAuthStateCookie(res: Response): void {
+  res.clearCookie("furlo_oauth_state", { path: "/" });
+}
 
 // Cookie setting options helper
 const getCookieOptions = (maxAgeMs: number) => ({
@@ -85,6 +110,307 @@ const loginSchema = z.object({
 const refreshSchema = z.object({
   refresh_token: z.string().min(1, "Refresh token is required"),
 });
+
+const verifyEmailOtpSchema = z.object({
+  email: z.string().email("Invalid email address"),
+  token: z
+    .string()
+    .min(6, "Verification code must be at least 6 characters")
+    .max(8, "Verification code is too long"),
+  password: z
+    .string()
+    .min(6, "Password must be at least 6 characters")
+    .optional(),
+});
+
+const oauthExchangeSchema = z.object({
+  code: z.string().min(1, "Authorization code is required"),
+  state: z.string().min(1, "OAuth state is required"),
+});
+
+const OAUTH_PKCE_TTL_MS = 15 * 60 * 1000;
+
+type OAuthPkceEntry = {
+  verifier: string;
+  redirectType: string;
+  expiresAt: number;
+};
+
+const oauthPkceByState = new Map<string, OAuthPkceEntry>();
+
+function purgeExpiredOAuthPkce(): void {
+  const now = Date.now();
+  for (const [state, entry] of oauthPkceByState) {
+    if (entry.expiresAt <= now) oauthPkceByState.delete(state);
+  }
+}
+
+function getSupabaseAuthStorageKey(): string {
+  const ref = new URL(supabaseUrl!).hostname.split(".")[0];
+  return `sb-${ref}-auth-token`;
+}
+
+function createMemoryAuthStorage() {
+  const map = new Map<string, string>();
+  return {
+    storage: {
+      getItem: (key: string) => map.get(key) ?? null,
+      setItem: (key: string, value: string) => {
+        map.set(key, value);
+      },
+      removeItem: (key: string) => {
+        map.delete(key);
+      },
+    },
+  };
+}
+
+/** Supabase auth-js stores PKCE values JSON-encoded via setItemAsync. */
+function parseStoredCodeVerifier(
+  raw: string | null,
+): { verifier: string; redirectType: string } | null {
+  if (!raw) return null;
+  let inner: string;
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    inner = typeof parsed === "string" ? parsed : raw;
+  } catch {
+    inner = raw;
+  }
+  const [verifier, redirectType = "pkce"] = inner.split("/");
+  if (!verifier) return null;
+  return { verifier, redirectType };
+}
+
+function createPkceAnonClient(mem: ReturnType<typeof createMemoryAuthStorage>) {
+  return createClient(supabaseUrl!, supabaseAnonKey!, {
+    auth: {
+      flowType: "pkce",
+      storage: mem.storage,
+      // Custom storage is ignored when persistSession is false (supabase-js).
+      persistSession: true,
+      autoRefreshToken: false,
+    },
+  });
+}
+
+function setSessionCookies(
+  res: Response,
+  access_token: string,
+  refresh_token: string,
+): void {
+  res.cookie(
+    "furlo_session",
+    access_token,
+    getCookieOptions(COOKIE_SESSION_MAX_AGE),
+  );
+  res.cookie(
+    "furlo_refresh",
+    refresh_token,
+    getCookieOptions(COOKIE_REFRESH_MAX_AGE),
+  );
+}
+
+async function resolveSessionUser(
+  req: Request,
+  res: Response,
+): Promise<{ user: { id: string; email?: string; email_confirmed_at?: string } } | null> {
+  const refreshToken = getCookie(req, "furlo_refresh");
+  const supabase = createClient(supabaseUrl!, supabaseServiceKey!);
+
+  for (const accessToken of listAccessTokens(req)) {
+    const {
+      data: { user },
+      error,
+    } = await supabase.auth.getUser(accessToken);
+    if (!error && user) return { user };
+  }
+
+  if (refreshToken) {
+    const { data, error } = await supabase.auth.refreshSession({
+      refresh_token: refreshToken,
+    });
+    if (!error && data.session?.user) {
+      setSessionCookies(res, data.session.access_token, data.session.refresh_token);
+      return { user: data.session.user };
+    }
+  }
+
+  return null;
+}
+
+function createAnonClient() {
+  if (!supabaseUrl || !supabaseAnonKey) {
+    return null;
+  }
+  if (jwtRole(supabaseAnonKey) === "service_role") {
+    console.error(
+      "[auth] SUPABASE_ANON_KEY appears to be service_role — OAuth will fail",
+    );
+    return null;
+  }
+  return createClient(supabaseUrl, supabaseAnonKey);
+}
+
+function isLocalhostUrl(url: string): boolean {
+  try {
+    const host = new URL(url).hostname;
+    return host === "localhost" || host === "127.0.0.1";
+  } catch {
+    return false;
+  }
+}
+
+function getAllowedOAuthCallbackHosts(): string[] {
+  const fromEnv = process.env.OAUTH_ALLOWED_CALLBACK_HOSTS;
+  if (fromEnv?.trim()) {
+    return fromEnv.split(",").map((h) => h.trim()).filter(Boolean);
+  }
+  return ["dev.furlopets.in", "furlopets.in", "localhost", "127.0.0.1"];
+}
+
+/** Mobile app deep link e.g. furlo://auth/callback (opens app, not the web site). */
+function normalizeMobileOAuthDeepLink(input: string): string | null {
+  try {
+    const u = new URL(input);
+    const scheme = u.protocol.replace(/:$/, "");
+    const allowedSchemes = (
+      process.env.OAUTH_ALLOWED_MOBILE_SCHEMES || "furlo"
+    )
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
+    if (!allowedSchemes.includes(scheme)) {
+      return null;
+    }
+    if (u.hostname !== "auth" || u.pathname.replace(/\/$/, "") !== "/callback") {
+      return null;
+    }
+    return `${scheme}://auth/callback`;
+  } catch {
+    return null;
+  }
+}
+
+/** Validates HTTPS callback URL e.g. https://dev.furlopets.in/auth/callback */
+function normalizeOAuthCallbackUrl(
+  input: string,
+  platform: "web" | "mobile",
+): string | null {
+  const deepLink = normalizeMobileOAuthDeepLink(input);
+  if (deepLink) {
+    return platform === "mobile" ? deepLink : null;
+  }
+
+  try {
+    const u = new URL(input);
+    if (u.pathname.replace(/\/$/, "") !== "/auth/callback") {
+      return null;
+    }
+    const allowed = getAllowedOAuthCallbackHosts();
+    if (!allowed.includes(u.hostname)) {
+      return null;
+    }
+    if (platform === "mobile" && isLocalhostUrl(u.origin)) {
+      return null;
+    }
+    if (platform === "mobile") {
+      const client = u.searchParams.get("client");
+      if (client !== "mobile") {
+        return null;
+      }
+    }
+    const base = `${u.origin}/auth/callback`;
+    if (platform === "mobile" && u.searchParams.get("client") === "mobile") {
+      return `${base}?client=mobile`;
+    }
+    return base;
+  } catch {
+    return null;
+  }
+}
+
+function getDefaultMobileOAuthRedirectTo(): string {
+  const fromEnv = process.env.MOBILE_OAUTH_REDIRECT_URL?.trim();
+  if (fromEnv) {
+    const normalized = normalizeMobileOAuthDeepLink(fromEnv);
+    if (normalized) return normalized;
+  }
+  return "furlo://auth/callback";
+}
+
+function getOAuthRedirectTo(req: Request, platform: "web" | "mobile"): string {
+  const queryRedirect = req.query.redirect_to;
+  if (typeof queryRedirect === "string" && queryRedirect.trim()) {
+    const normalized = normalizeOAuthCallbackUrl(queryRedirect.trim(), platform);
+    if (normalized) {
+      return normalized;
+    }
+  }
+
+  if (platform === "mobile") {
+    return getDefaultMobileOAuthRedirectTo();
+  }
+
+  const oauthBase = process.env.OAUTH_REDIRECT_BASE_URL?.replace(/\/$/, "");
+  if (oauthBase && isLocalhostUrl(getFrontendUrl(req))) {
+    return `${oauthBase}/auth/callback`;
+  }
+
+  return `${getFrontendUrl(req)}/auth/callback`;
+}
+
+async function findAuthUserByEmail(
+  supabase: ReturnType<typeof createClient>,
+  email: string,
+) {
+  const normalized = email.toLowerCase();
+  for (let page = 1; page <= 10; page += 1) {
+    const { data, error } = await supabase.auth.admin.listUsers({
+      page,
+      perPage: 200,
+    });
+    if (error) {
+      throw error;
+    }
+    const match = data.users.find(
+      (u) => u.email?.toLowerCase() === normalized,
+    );
+    if (match) return match;
+    if (data.users.length < 200) break;
+  }
+  return null;
+}
+
+/**
+ * Sends a 6-digit OTP via the **Magic link or OTP** template (must include {{ .Token }},
+ * not {{ .ConfirmationURL }}). Never uses Confirm sign up / auth.signUp() mail.
+ */
+async function sendEmailVerificationOtp(
+  email: string,
+  mode: "signup" | "resend",
+): Promise<{ ok: true } | { ok: false; error: string }> {
+  const anon = createAnonClient();
+  if (!anon) {
+    return {
+      ok: false,
+      error: "Email verification is not configured (SUPABASE_ANON_KEY).",
+    };
+  }
+
+  const shouldCreateUser = mode === "signup";
+
+  const { error } = await anon.auth.signInWithOtp({
+    email,
+    options: { shouldCreateUser },
+  });
+
+  if (error) {
+    return { ok: false, error: error.message };
+  }
+
+  return { ok: true };
+}
 
 /**
  * Helper to fetch public user details and active pet profile
@@ -137,7 +463,7 @@ async function fetchUserContext(supabase: any, userId: string) {
   const { data: activePet, error: petError } = await supabase
     .from("pets")
     .select(
-      "id, owner_id, username, name, profile_image_url, breed, city, personality_tags, gender, bio, is_verified, is_founding_pet",
+      "id, owner_id, username, name, profile_image_url, breed, city, personality_tags, gender, bio, date_of_birth, is_verified, is_founding_pet",
     )
     .eq("owner_id", userId)
     .eq("status", "active")
@@ -183,49 +509,45 @@ router.post("/signup", async (req: Request, res: Response): Promise<void> => {
 
     const { email, password } = parsed.data;
     const supabase = createClient(supabaseUrl!, supabaseServiceKey!);
-    const frontendUrl = getFrontendUrl(req);
 
-    const { data, error } = await supabase.auth.signUp({
-      email,
-      password,
-      options: {
-        emailRedirectTo: `${frontendUrl}/auth/callback`,
-      },
-    });
+    // Password is applied after OTP in POST /auth/verify-email-otp (not at signUp).
+    void password;
 
-    if (error) {
-      res.status(error.status ?? 400).json({ error: error.message });
+    let existingUser: Awaited<ReturnType<typeof findAuthUserByEmail>> = null;
+    try {
+      existingUser = await findAuthUserByEmail(supabase, email);
+    } catch (listErr) {
+      console.error("[auth] Signup user lookup error:", listErr);
+      res.status(500).json({ error: "Could not check existing accounts." });
       return;
     }
 
-    if (data.session) {
-      const cookieOptsSession = getCookieOptions(COOKIE_SESSION_MAX_AGE);
-      const cookieOptsRefresh = getCookieOptions(COOKIE_REFRESH_MAX_AGE);
-
-      res.setHeader("Set-Cookie", [
-        `furlo_session=${encodeURIComponent(data.session.access_token)}; ${Object.entries(
-          cookieOptsSession,
-        )
-          .map(([k, v]) => `${k}=${v}`)
-          .join("; ")}`,
-        `furlo_refresh=${encodeURIComponent(data.session.refresh_token)}; ${Object.entries(
-          cookieOptsRefresh,
-        )
-          .map(([k, v]) => `${k}=${v}`)
-          .join("; ")}`,
-      ]);
+    if (existingUser?.email_confirmed_at) {
+      res.status(400).json({
+        error: "An account with this email already exists. Please sign in.",
+      });
+      return;
     }
 
-    const requiresVerification =
-      !data.session || (data.user && !data.user.email_confirmed_at);
+    const otpSend = await sendEmailVerificationOtp(
+      email,
+      existingUser ? "resend" : "signup",
+    );
+    if (!otpSend.ok) {
+      res.status(502).json({
+        error:
+          otpSend.error ||
+          "Could not send verification code. In Supabase, edit Authentication → Email Templates → Magic link or OTP: use {{ .Token }} and remove {{ .ConfirmationURL }}.",
+      });
+      return;
+    }
 
     res.status(201).json({
-      message: requiresVerification
-        ? "Signup successful! Please check your email to confirm your account."
-        : "Signup successful!",
-      user: data.user,
-      session: data.session,
-      requiresVerification,
+      message:
+        "Signup successful! Enter the verification code we sent to your email.",
+      user: null,
+      session: null,
+      requiresVerification: true,
     });
   } catch (err) {
     console.error("[auth] Signup error:", err);
@@ -235,7 +557,7 @@ router.post("/signup", async (req: Request, res: Response): Promise<void> => {
 
 /**
  * POST /auth/resend-confirmation
- * Resend email confirmation link
+ * Resend email confirmation OTP
  */
 router.post(
   "/resend-confirmation",
@@ -247,25 +569,16 @@ router.post(
         return;
     }
 
-      const supabase = createClient(supabaseUrl!, supabaseServiceKey!);
-      const frontendUrl = getFrontendUrl(req);
+      const otpSend = await sendEmailVerificationOtp(email, "resend");
 
-    const { error } = await supabase.auth.resend({
-        type: "signup",
-      email,
-      options: {
-        emailRedirectTo: `${frontendUrl}/auth/callback`,
-      },
-      });
-
-    if (error) {
-        res.status(400).json({ error: error.message });
+    if (!otpSend.ok) {
+        res.status(400).json({ error: otpSend.error });
         return;
     }
 
       res
         .status(200)
-        .json({ message: "Verification email resent successfully." });
+        .json({ message: "Verification code resent successfully." });
   } catch (err) {
       console.error("[auth] Resend confirmation error:", err);
       res.status(500).json({ error: "Failed to resend verification email." });
@@ -307,39 +620,6 @@ router.get(
     }
 
       const verified = Boolean(user.email_confirmed_at);
-
-    if (verified) {
-      // Auto-establish session cookies for Tab A via admin magiclink token exchange
-      try {
-        const { data: linkData } = await supabase.auth.admin.generateLink({
-            type: "magiclink",
-          email: user.email!,
-          });
-        if (linkData?.properties?.hashed_token) {
-          const { data: otpRes } = await supabase.auth.verifyOtp({
-            token_hash: linkData.properties.hashed_token,
-              type: "magiclink",
-            });
-          if (otpRes?.session) {
-              res.cookie(
-                "furlo_session",
-                otpRes.session.access_token,
-                getCookieOptions(COOKIE_SESSION_MAX_AGE),
-              );
-              res.cookie(
-                "furlo_refresh",
-                otpRes.session.refresh_token,
-                getCookieOptions(COOKIE_REFRESH_MAX_AGE),
-              );
-          }
-        }
-      } catch (genErr) {
-          console.warn(
-            "[auth] Warning auto-establishing session on check-verification:",
-            genErr,
-          );
-      }
-    }
 
       res.status(200).json({ verified, exists: true });
   } catch (err) {
@@ -570,85 +850,28 @@ router.post("/logout", async (req: Request, res: Response): Promise<void> => {
  */
 router.get("/me", async (req: Request, res: Response): Promise<void> => {
   try {
-    let accessToken = getAccessToken(req);
-    const refreshToken = getCookie(req, "furlo_refresh");
+    const session = await resolveSessionUser(req, res);
+    if (!session?.user) {
+      clearSessionCookies(res);
+      res.status(401).json({ error: "Unauthorized. Please log in." });
+      return;
+    }
+
     const supabase = createClient(supabaseUrl!, supabaseServiceKey!);
-
-    // 1. If access token is present, attempt to authenticate
-    if (accessToken) {
-      const {
-        data: { user },
-        error,
-      } = await supabase.auth.getUser(accessToken);
-
-      if (!error && user) {
-        const context = await fetchUserContext(supabase, user.id);
-        if (context) {
-          const blocked = accountBlockMessage(context.user?.status);
-          if (blocked) {
-            res.clearCookie("furlo_session", { path: "/" });
-            res.clearCookie("furlo_refresh", { path: "/" });
-            res.status(403).json({ error: blocked });
-            return;
-          }
-          res.status(200).json(context);
-          return;
-        }
-      }
+    const context = await fetchUserContext(supabase, session.user.id);
+    if (!context) {
+      res.status(401).json({ error: "Unauthorized. Please log in." });
+      return;
     }
 
-    // 2. If access token is expired/invalid but refresh token is present, refresh the session
-    if (refreshToken) {
-      console.log(
-        "[auth] Access token expired or missing. Attempting refresh...",
-      );
-      const { data, error: refreshError } = await supabase.auth.refreshSession({
-        refresh_token: refreshToken,
-      });
-
-      if (!refreshError && data.session) {
-        const {
-          access_token: newAccessToken,
-          refresh_token: newRefreshToken,
-          user,
-        } = data.session;
-
-        // Issue fresh cookies
-        res.cookie(
-          "furlo_session",
-          newAccessToken,
-          getCookieOptions(COOKIE_SESSION_MAX_AGE),
-        );
-        res.cookie(
-          "furlo_refresh",
-          newRefreshToken,
-          getCookieOptions(COOKIE_REFRESH_MAX_AGE),
-        );
-
-        const context = await fetchUserContext(supabase, user.id);
-        if (context) {
-          const blocked = accountBlockMessage(context.user?.status);
-          if (blocked) {
-            res.clearCookie("furlo_session", { path: "/" });
-            res.clearCookie("furlo_refresh", { path: "/" });
-            res.status(403).json({ error: blocked });
-            return;
-          }
-          res.status(200).json(context);
-          return;
-        }
-      }
-      
-      console.warn(
-        "[auth] Refresh token invalid or expired:",
-        refreshError?.message,
-      );
+    const blocked = accountBlockMessage(context.user?.status);
+    if (blocked) {
+      clearSessionCookies(res);
+      res.status(403).json({ error: blocked });
+      return;
     }
 
-    // 3. Unauthenticated — clear any lingering cookies
-    res.clearCookie("furlo_session", { path: "/" });
-    res.clearCookie("furlo_refresh", { path: "/" });
-    res.status(401).json({ error: "Unauthorized. Please log in." });
+    res.status(200).json(context);
   } catch (err) {
     console.error("[auth] Session me error:", err);
     res
@@ -656,6 +879,301 @@ router.get("/me", async (req: Request, res: Response): Promise<void> => {
       .json({ error: "Internal server error validating session." });
   }
 });
+
+/**
+ * POST /auth/verify-email-otp
+ * Confirm signup with 6-digit email OTP
+ */
+router.post(
+  "/verify-email-otp",
+  async (req: Request, res: Response): Promise<void> => {
+    try {
+      const parsed = verifyEmailOtpSchema.safeParse(req.body);
+      if (!parsed.success) {
+        res.status(400).json({ error: parsed.error.issues[0].message });
+        return;
+      }
+
+      const { email, token, password } = parsed.data;
+      const supabase = createClient(supabaseUrl!, supabaseServiceKey!);
+      const otpToken = token.replace(/\s/g, "");
+
+      let session: { access_token: string; refresh_token: string; user: { id: string } } | null =
+        null;
+      let lastError: string | undefined;
+
+      for (const type of ["email", "signup"] as const) {
+        const { data, error } = await supabase.auth.verifyOtp({
+          email,
+          token: otpToken,
+          type,
+        });
+        if (!error && data.session) {
+          session = data.session;
+          break;
+        }
+        lastError = error?.message;
+      }
+
+      if (!session) {
+        res.status(400).json({
+          error: lastError || "Invalid or expired verification code.",
+        });
+        return;
+      }
+
+      const { access_token, refresh_token, user } = session;
+
+      if (password) {
+        const { error: passwordError } = await supabase.auth.admin.updateUserById(
+          user.id,
+          { password },
+        );
+        if (passwordError) {
+          res.status(400).json({ error: passwordError.message });
+          return;
+        }
+      }
+
+      const context = await fetchUserContext(supabase, user.id);
+      if (context?.user?.status && context.user.status !== "active") {
+        res.status(403).json({
+          error:
+            accountBlockMessage(context.user.status) ||
+            "This account has been suspended.",
+        });
+        return;
+      }
+
+      setSessionCookies(res, access_token, refresh_token);
+
+      if (!context) {
+        res.status(500).json({ error: "Failed to retrieve user context profile." });
+        return;
+      }
+
+      res.status(200).json({
+        user: context.user,
+        activePet: context.activePet,
+        session: {
+          access_token,
+          refresh_token,
+        },
+      });
+    } catch (err) {
+      console.error("[auth] Verify email OTP error:", err);
+      res.status(500).json({ error: "Internal server error verifying email code." });
+    }
+  },
+);
+
+async function exchangeOAuthCodeForSession(code: string, state?: string) {
+  if (!supabaseUrl || !supabaseAnonKey) {
+    return {
+      data: { session: null, user: null },
+      error: { message: "OAuth is not configured (SUPABASE_ANON_KEY)." },
+    };
+  }
+
+  purgeExpiredOAuthPkce();
+  const storageKey = getSupabaseAuthStorageKey();
+  const mem = createMemoryAuthStorage();
+
+  const flowState = state?.trim();
+  if (!flowState) {
+    return {
+      data: { session: null, user: null },
+      error: {
+        message:
+          "Missing OAuth state. Start Google sign-in again from the app (do not open the callback link in a browser).",
+      },
+    };
+  }
+
+  const entry = oauthPkceByState.get(flowState);
+  if (!entry || entry.expiresAt <= Date.now()) {
+    return {
+      data: { session: null, user: null },
+      error: { message: "OAuth session expired. Please try Google sign-in again." },
+    };
+  }
+  mem.storage.setItem(
+    `${storageKey}-code-verifier`,
+    JSON.stringify(`${entry.verifier}/${entry.redirectType}`),
+  );
+  oauthPkceByState.delete(flowState);
+
+  const client = createPkceAnonClient(mem);
+
+  return client.auth.exchangeCodeForSession(code);
+}
+
+async function buildGoogleOAuthUrl(
+  req: Request,
+  platform: "web" | "mobile",
+): Promise<{ url: string; state?: string } | { error: string }> {
+  if (!supabaseUrl || !supabaseAnonKey) {
+    return { error: "OAuth is not configured (missing or invalid SUPABASE_ANON_KEY)." };
+  }
+
+  purgeExpiredOAuthPkce();
+  const mem = createMemoryAuthStorage();
+  const anon = createPkceAnonClient(mem);
+
+  const { data, error } = await anon.auth.signInWithOAuth({
+    provider: "google",
+    options: {
+      redirectTo: getOAuthRedirectTo(req, platform),
+      skipBrowserRedirect: true,
+    },
+  });
+
+  if (error || !data.url) {
+    return { error: error?.message || "Failed to start Google sign-in." };
+  }
+
+  const storageKey = getSupabaseAuthStorageKey();
+  const verifierRaw = mem.storage.getItem(`${storageKey}-code-verifier`);
+  const parsedVerifier = parseStoredCodeVerifier(verifierRaw);
+
+  if (!parsedVerifier) {
+    console.error("[auth] OAuth PKCE verifier missing after signInWithOAuth");
+    return { error: "Failed to initialize Google sign-in (PKCE). Try again." };
+  }
+
+  const flowState = randomUUID();
+  oauthPkceByState.set(flowState, {
+    verifier: parsedVerifier.verifier,
+    redirectType: parsedVerifier.redirectType,
+    expiresAt: Date.now() + OAUTH_PKCE_TTL_MS,
+  });
+
+  return { url: data.url, state: flowState };
+}
+
+/**
+ * GET /auth/oauth/google/url
+ * JSON OAuth URL for mobile clients
+ */
+router.get("/oauth/google/url", async (req: Request, res: Response): Promise<void> => {
+  try {
+    const platform =
+      req.query.platform === "mobile" ? "mobile" : "web";
+    const result = await buildGoogleOAuthUrl(req, platform);
+    if ("error" in result) {
+      res.status(503).json({ error: result.error });
+      return;
+    }
+    res.status(200).json({ url: result.url, state: result.state });
+  } catch (err) {
+    console.error("[auth] OAuth URL error:", err);
+    res.status(500).json({ error: "Failed to build Google sign-in URL." });
+  }
+});
+
+/**
+ * GET /auth/oauth/google
+ * Redirect browser to Google via Supabase OAuth
+ */
+router.get("/oauth/google", async (req: Request, res: Response): Promise<void> => {
+  try {
+    const platform =
+      req.query.platform === "mobile" ? "mobile" : "web";
+    const wantsJson =
+      req.query.format === "json" ||
+      req.headers.accept?.includes("application/json");
+
+    const result = await buildGoogleOAuthUrl(req, platform);
+    if ("error" in result) {
+      if (wantsJson) {
+        res.status(503).json({ error: result.error });
+      } else {
+        res.redirect(
+          `${getFrontendUrl(req)}/join?mode=signin&error=oauth_failed`,
+        );
+      }
+      return;
+    }
+
+    if (wantsJson) {
+      res.status(200).json({ url: result.url, state: result.state });
+      return;
+    }
+
+    res.cookie(
+      "furlo_oauth_state",
+      result.state,
+      getCookieOptions(OAUTH_PKCE_TTL_MS),
+    );
+    res.redirect(result.url);
+  } catch (err) {
+    console.error("[auth] OAuth redirect error:", err);
+    res.redirect(
+      `${getFrontendUrl(req)}/join?mode=signin&error=oauth_failed`,
+    );
+  }
+});
+
+/**
+ * POST /auth/oauth/exchange
+ * Exchange PKCE code for session (mobile / JSON clients)
+ */
+router.post(
+  "/oauth/exchange",
+  async (req: Request, res: Response): Promise<void> => {
+    try {
+      const parsed = oauthExchangeSchema.safeParse(req.body);
+      if (!parsed.success) {
+        res.status(400).json({ error: parsed.error.issues[0].message });
+        return;
+      }
+
+      const { data, error } = await exchangeOAuthCodeForSession(
+        parsed.data.code,
+        parsed.data.state,
+      );
+
+      if (error || !data.session) {
+        res.status(400).json({
+          error: error?.message || "Failed to complete Google sign-in.",
+        });
+        return;
+      }
+
+      const { access_token, refresh_token, user } = data.session;
+      const supabase = createClient(supabaseUrl!, supabaseServiceKey!);
+
+      const context = await fetchUserContext(supabase, user.id);
+      if (context?.user?.status && context.user.status !== "active") {
+        res.status(403).json({
+          error:
+            accountBlockMessage(context.user.status) ||
+            "This account has been suspended.",
+        });
+        return;
+      }
+
+      setSessionCookies(res, access_token, refresh_token);
+
+      if (!context) {
+        res.status(500).json({ error: "Failed to retrieve user context profile." });
+        return;
+      }
+
+      res.status(200).json({
+        user: context.user,
+        activePet: context.activePet,
+        session: {
+          access_token,
+          refresh_token,
+        },
+      });
+    } catch (err) {
+      console.error("[auth] OAuth exchange error:", err);
+      res.status(500).json({ error: "Internal server error during OAuth exchange." });
+    }
+  },
+);
 
 /**
  * GET /auth/callback
@@ -680,7 +1198,11 @@ router.get("/callback", async (req: Request, res: Response): Promise<void> => {
         sessionData = data.session;
       }
     } else if (code) {
-      const { data, error } = await supabase.auth.exchangeCodeForSession(code);
+      const stateFromQuery = req.query.state as string | undefined;
+      const stateFromCookie = getCookie(req, "furlo_oauth_state");
+      const state = stateFromQuery?.trim() || stateFromCookie?.trim();
+      const { data, error } = await exchangeOAuthCodeForSession(code, state);
+      clearOAuthStateCookie(res);
       if (!error && data.session) {
         sessionData = data.session;
       }
@@ -688,6 +1210,7 @@ router.get("/callback", async (req: Request, res: Response): Promise<void> => {
 
     if (!sessionData) {
       console.error("[auth] Auth callback failed to exchange session.");
+      clearOAuthStateCookie(res);
       res.redirect(`${frontendUrl}/join?error=verification_failed`);
       return;
     }
@@ -770,8 +1293,54 @@ router.get(
   },
 );
 
+const petDateOfBirthSchema = z
+  .string()
+  .regex(/^\d{4}-\d{2}-\d{2}$/, "Date of birth must be YYYY-MM-DD")
+  .refine((value) => {
+    const [y, m, d] = value.split("-").map(Number);
+    const parsed = new Date(y, m - 1, d);
+    if (
+      parsed.getFullYear() !== y ||
+      parsed.getMonth() !== m - 1 ||
+      parsed.getDate() !== d
+    ) {
+      return false;
+    }
+    const today = new Date();
+    today.setHours(23, 59, 59, 999);
+    return parsed.getTime() <= today.getTime();
+  }, "Date of birth cannot be in the future");
+
+function normalizePetDateOfBirthInput(
+  body: Record<string, unknown>,
+): string | null | undefined {
+  if (!("dateOfBirth" in body) && !("date_of_birth" in body)) {
+    return undefined;
+  }
+  const raw = body.dateOfBirth ?? body.date_of_birth;
+  if (raw === null || raw === "") return null;
+  if (typeof raw !== "string") {
+    throw new Error("Invalid date of birth");
+  }
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+  const parsed = petDateOfBirthSchema.safeParse(trimmed);
+  if (!parsed.success) {
+    throw new Error(parsed.error.issues[0]?.message || "Invalid date of birth");
+  }
+  return parsed.data;
+}
+
 const onboardingSetupSchema = z.object({
   role: z.enum(["parent", "lover"]).optional(),
+  parentName: z
+    .string()
+    .trim()
+    .min(2, "Pet parent name must be at least 2 characters"),
+  termsAccepted: z
+    .boolean()
+    .refine((v) => v === true, { message: "You must accept the Terms of Service" }),
+  marketingOptIn: z.boolean().optional().default(false),
   petName: z.string().min(1, "Name is required"),
   petUsername: z.string().optional(),
   petType: z.string().optional(),
@@ -780,6 +1349,8 @@ const onboardingSetupSchema = z.object({
   customBreed: z.string().optional(),
   city: z.string().min(1, "City is required"),
   gender: z.enum(["male", "female", "unknown"]).optional(),
+  dateOfBirth: petDateOfBirthSchema.optional(),
+  date_of_birth: petDateOfBirthSchema.optional(),
   bio: z.string().max(300).optional(),
   personalityTags: z.array(z.string()).optional(),
   customPersonalityTags: z.array(z.string()).optional(),
@@ -898,28 +1469,19 @@ router.post(
   "/complete-onboarding",
   async (req: Request, res: Response): Promise<void> => {
   try {
-      const accessToken = getAccessToken(req);
-    if (!accessToken) {
-        res.status(401).json({ error: "Unauthorized. Please login first." });
-        return;
-    }
-
       const parsed = onboardingSetupSchema.safeParse(req.body);
     if (!parsed.success) {
         res.status(400).json({ error: parsed.error.issues[0].message });
         return;
       }
 
-      const supabase = createClient(supabaseUrl!, supabaseServiceKey!);
-      const {
-        data: { user },
-        error: authError,
-      } = await supabase.auth.getUser(accessToken);
-
-    if (authError || !user) {
-        res.status(401).json({ error: "Unauthorized. Invalid session." });
+      const session = await resolveSessionUser(req, res);
+    if (!session?.user) {
+        res.status(401).json({ error: "Unauthorized. Please login first." });
         return;
     }
+      const user = session.user;
+      const supabase = createClient(supabaseUrl!, supabaseServiceKey!);
 
     // 1. Ensure user row exists in public.users table (mirroring auth.users)
     try {
@@ -937,6 +1499,9 @@ router.post(
       }
 
       const {
+        parentName,
+        termsAccepted,
+        marketingOptIn,
         role,
         petName,
         petUsername: rawUsername,
@@ -951,7 +1516,30 @@ router.post(
         customPersonalityTags,
         avatarData,
         packs,
+        dateOfBirth,
+        date_of_birth,
       } = parsed.data;
+
+      const resolvedDateOfBirth = dateOfBirth ?? date_of_birth ?? null;
+
+      const now = new Date().toISOString();
+      const { error: profileError } = await supabase.from("profiles").upsert(
+        {
+          id: user.id,
+          full_name: parentName,
+          terms_accepted_at: now,
+          marketing_opt_in: marketingOptIn ?? false,
+          updated_at: now,
+        },
+        { onConflict: "id" },
+      );
+      if (profileError) {
+        console.error("[auth] Profile upsert error:", profileError.message);
+        res
+          .status(500)
+          .json({ error: `Failed to save profile: ${profileError.message}` });
+        return;
+      }
 
     // If username is provided, sanitize & check availability. Otherwise autogenerate a clean unique handle.
       let petUsername = rawUsername
@@ -1036,6 +1624,7 @@ router.post(
       profile_image_url: profileImageUrl,
         vaccination_status: "unknown",
       is_public: true,
+      ...(resolvedDateOfBirth ? { date_of_birth: resolvedDateOfBirth } : {}),
       };
 
     // Check if pet profile already exists for this owner in database
@@ -1064,6 +1653,7 @@ router.post(
             bio: bio || "",
           personality_tags: personalityTags || [],
           profile_image_url: profileImageUrl,
+          date_of_birth: resolvedDateOfBirth,
           updated_at: new Date().toISOString(),
         })
           .eq("id", existingPet[0].id)
@@ -1235,7 +1825,28 @@ router.put(
         return;
     }
 
-      const { petId, name, username, breed, city, bio, avatarData, removeAvatar, personalityTags, personality_tags } = req.body;
+      const {
+        petId,
+        name,
+        username,
+        breed,
+        city,
+        bio,
+        avatarData,
+        removeAvatar,
+        personalityTags,
+        personality_tags,
+      } = req.body;
+
+      let dateOfBirthUpdate: string | null | undefined;
+      try {
+        dateOfBirthUpdate = normalizePetDateOfBirthInput(req.body);
+      } catch (e) {
+        res.status(400).json({
+          error: e instanceof Error ? e.message : "Invalid date of birth",
+        });
+        return;
+      }
 
       let profileImageUrl: string | undefined = undefined;
 
@@ -1287,6 +1898,9 @@ router.put(
         ...(profileImageUrl !== undefined && {
           profile_image_url: profileImageUrl,
         }),
+        ...(dateOfBirthUpdate !== undefined && {
+          date_of_birth: dateOfBirthUpdate,
+        }),
       updated_at: new Date().toISOString(),
       };
 
@@ -1328,14 +1942,14 @@ router.get("/pet/:id", async (req: Request, res: Response): Promise<void> => {
       ? await supabase
           .from("pets")
           .select(
-            "id, owner_id, name, username, breed, city, gender, bio, personality_tags, profile_image_url, created_at, is_verified, is_founding_pet",
+            "id, owner_id, name, username, breed, city, gender, bio, personality_tags, profile_image_url, date_of_birth, created_at, is_verified, is_founding_pet",
           )
           .eq("id", param)
           .limit(1)
       : await supabase
           .from("pets")
           .select(
-            "id, owner_id, name, username, breed, city, gender, bio, personality_tags, profile_image_url, created_at, is_verified, is_founding_pet",
+            "id, owner_id, name, username, breed, city, gender, bio, personality_tags, profile_image_url, date_of_birth, created_at, is_verified, is_founding_pet",
           )
           .eq("username", param)
           .limit(1);
@@ -1349,12 +1963,25 @@ router.get("/pet/:id", async (req: Request, res: Response): Promise<void> => {
 
     let ownerUser = null;
     if (petRecord.owner_id) {
-      const { data: owner } = await supabase
-        .from("users")
-        .select("id, name, email")
-        .eq("id", petRecord.owner_id)
-        .single();
-      ownerUser = owner || null;
+      const [{ data: owner }, { data: profile }] = await Promise.all([
+        supabase
+          .from("users")
+          .select("id, email")
+          .eq("id", petRecord.owner_id)
+          .single(),
+        supabase
+          .from("profiles")
+          .select("id, full_name")
+          .eq("id", petRecord.owner_id)
+          .maybeSingle(),
+      ]);
+      if (owner) {
+        ownerUser = {
+          id: owner.id,
+          email: owner.email,
+          name: profile?.full_name,
+        };
+      }
     }
 
     const pet = {

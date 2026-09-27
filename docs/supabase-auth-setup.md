@@ -11,6 +11,7 @@ Dashboard checklist for Furlo. Secrets stay in Supabase; Furlo backend only uses
 | `SUPABASE_URL` | Project URL |
 | `SUPABASE_ANON_KEY` | anon public |
 | `SUPABASE_SERVICE_KEY` | service_role (never expose to clients) |
+| `SUPABASE_JWT_SECRET` | JWT Secret (API settings) — required for per-user rate limits |
 
 ## Custom SMTP (Hostinger)
 

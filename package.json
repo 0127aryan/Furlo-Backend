@@ -10,11 +10,13 @@
     "migrate": "tsx scripts/migrate.ts"
   },
   "dependencies": {
+    "@sentry/node": "^9.47.1",
     "@supabase/supabase-js": "^2.107.0",
     "cors": "^2.8.5",
     "dotenv": "^16.4.7",
     "express": "^4.21.2",
     "firebase-admin": "^14.4.0",
+    "jose": "^6.2.12",
     "pg": "^8.23.0",
     "zod": "^3.24.2"
   },

@@ -383,6 +383,25 @@ router.post("/create", async (req: Request, res: Response): Promise<void> => {
       return;
     }
 
+    const postLimitPerHour = Number(process.env.POST_RATE_LIMIT_PER_HOUR) || 10;
+    const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+    const { count: recentPostCount, error: countError } = await supabase
+      .from("posts")
+      .select("id", { count: "exact", head: true })
+      .eq("pet_id", petId)
+      .eq("status", "active")
+      .gte("created_at", oneHourAgo);
+
+    if (countError) {
+      console.error("[posts] Post rate limit count error:", countError.message);
+    } else if ((recentPostCount ?? 0) >= postLimitPerHour) {
+      res.status(429).json({
+        error: `This pet can post at most ${postLimitPerHour} times per hour. Try again later.`,
+        retryAfterSeconds: 3600,
+      });
+      return;
+    }
+
     // Insert post
     const { data: newPost, error: postError } = await supabase
       .from("posts")

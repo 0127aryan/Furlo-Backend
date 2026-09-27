@@ -9,7 +9,7 @@ Express API for the Furlo pet community platform. Talks to PostgreSQL via Supaba
 - **Auth**: Supabase Auth (JWT + Google OAuth)
 - **Storage**: Supabase Storage
 - **Push**: Firebase Cloud Messaging (optional)
-- **Email**: Resend (via Supabase SMTP)
+- **Email**: Custom SMTP via Supabase (e.g. Hostinger) — see [docs/supabase-auth-setup.md](docs/supabase-auth-setup.md)
 
 Default port: **4000** (`http://localhost:4000`)
 
@@ -59,6 +59,10 @@ DATABASE_URL=postgresql://postgres:YOUR_PASSWORD@db.YOUR_PROJECT.supabase.co:543
 
 `FRONTEND_URL` is required at startup. Use the **service_role** key for `SUPABASE_SERVICE_KEY` (never the anon key).
 
+**Auth (OTP email + Google):** Configure Supabase dashboard per [docs/supabase-auth-setup.md](docs/supabase-auth-setup.md).
+
+**Storage (avatars / posts):** Create the `pet-profiles` bucket per [docs/supabase-storage-setup.md](docs/supabase-storage-setup.md).
+
 Optional push: `FIREBASE_SERVICE_ACCOUNT_PATH` or `FIREBASE_SERVICE_ACCOUNT_JSON`.
 
 ### 3. Run migrations
@@ -83,6 +87,7 @@ Or run each file in `supabase/migrations/` in the Supabase SQL Editor, in filena
 | `20260914_notifications_phase9_fix.sql` | Notifications Phase 9 fix |
 | `20260914_push_tokens_and_quiet_hours.sql` | Push tokens + quiet hours |
 | `20260915_admin_dashboard.sql` | Admin dashboard |
+| `20260921_pet_profiles_storage.sql` | Storage bucket `pet-profiles` + policies |
 
 ### 4. Start the server
 

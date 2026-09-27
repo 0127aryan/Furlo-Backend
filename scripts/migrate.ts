@@ -62,13 +62,27 @@ async function checkMigrationNeeded(
   return { needed: false, reason: "All target tables and columns are already present in database" };
 }
 
+function migrationDbHost(connectionString: string): string {
+  try {
+    return new URL(connectionString.replace(/^postgresql:/, "http:")).hostname;
+  } catch {
+    return "(invalid DATABASE_URL)";
+  }
+}
+
 export async function runMigrations() {
   const connectionString =
-    process.env.DATABASE_URL ||
-    process.env.SUPABASE_DB_URL ||
-    `postgresql://postgres:${encodeURIComponent("Furlo@02062026")}@db.fhexwzurursdfeahvloq.supabase.co:5432/postgres`;
+    process.env.DATABASE_URL || process.env.SUPABASE_DB_URL;
 
-  console.log("[Migration] Connecting to database...");
+  if (!connectionString?.trim()) {
+    throw new Error(
+      "Set DATABASE_URL (or SUPABASE_DB_URL) in Furlo-Backend/.env — Supabase Dashboard → Project Settings → Database → Connection string → URI. Prefer Session pooler (IPv4-friendly) over direct db.* host.",
+    );
+  }
+
+  console.log(
+    `[Migration] Connecting to database (${migrationDbHost(connectionString)})...`,
+  );
 
   const client = new pg.Client({
     connectionString,
@@ -180,6 +194,14 @@ if (process.argv[1] && process.argv[1].endsWith("migrate.ts")) {
     })
     .catch((err) => {
       console.error("[Migration] Fatal migration error:", err);
+      if (err?.code === "ENOTFOUND") {
+        console.error(
+          "[Migration] DNS could not resolve the database host. Try:\n" +
+            "  1. Use the Session pooler URI from Supabase (not db.<ref>.supabase.co), or\n" +
+            "  2. Set system DNS to 8.8.8.8 / 1.1.1.1, or\n" +
+            "  3. Run pending SQL files in Supabase Dashboard → SQL Editor.",
+        );
+      }
       process.exit(1);
     });
 }
